@@ -53,6 +53,8 @@ class MainActivity : FlutterActivity() {
             get() = _rdClipboardManager;
     }
 
+    private var xrController: com.carriez.flutter_hbb.xr.XrController? = null
+
     private val channelTag = "mChannel"
     private val logTag = "mMainActivity"
     private var mainService: MainService? = null
@@ -81,6 +83,7 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        xrController = com.carriez.flutter_hbb.xr.XrController(this, flutterEngine.dartExecutor.binaryMessenger)
         if (MainService.isReady) {
             Intent(activity, MainService::class.java).also {
                 bindService(it, serviceConnection, Context.BIND_AUTO_CREATE)
@@ -102,6 +105,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
+        xrController?.resume()
         val inputPer = InputService.isOpen
         activity.runOnUiThread {
             flutterMethodChannel?.invokeMethod(
@@ -109,6 +113,11 @@ class MainActivity : FlutterActivity() {
                 mapOf("name" to "input", "value" to inputPer.toString())
             )
         }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        xrController?.permissionResult(requestCode, grantResults)
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -256,6 +265,7 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         documentPicker.close()
         Log.e(logTag, "onDestroy")
+        xrController?.dispose()
         // The process can outlive the UI whenever something keeps it alive:
         // MainService, or the accessibility InputService on its own. Only the
         // former gets onTaskRemoved, so close outgoing sessions here too,
@@ -1024,6 +1034,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onStop() {
         super.onStop()
+        xrController?.pause()
         val disableFloatingWindow = FFI.getLocalOption("disable-floating-window") == "Y"
         if (!disableFloatingWindow && MainService.isReady) {
             startService(Intent(this, FloatingWindowService::class.java))

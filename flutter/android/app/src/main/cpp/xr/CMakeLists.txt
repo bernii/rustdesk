@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(rustdesk_xr LANGUAGES CXX)
+add_library(rustdesk_xr SHARED renderer.cpp)
+target_compile_features(rustdesk_xr PRIVATE cxx_std_17)
+target_compile_options(rustdesk_xr PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(rustdesk_xr GLESv2)
+target_link_options(rustdesk_xr PRIVATE "-Wl,-z,max-page-size=16384")

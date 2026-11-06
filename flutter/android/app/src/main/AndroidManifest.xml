@@ -20,6 +20,7 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <queries>
+        <intent><action android:name="android.speech.RecognitionService" /></intent>
         <intent>
             <!-- https://developer.android.com/training/package-visibility/use-cases#open-urls-custom-tabs -->
             <action android:name="android.support.customtabs.action.CustomTabsService" />
@@ -29,7 +30,7 @@
     <application
         android:name=".MainApplication"
         android:icon="@mipmap/ic_launcher"
-        android:label="RustDesk"
+        android:label="rustdesk-xr"
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true">
 
@@ -82,6 +83,15 @@
                 <data android:scheme="rustdesk" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".xr.XrViewerActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity="${applicationId}.viewer"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode"
+            android:theme="@android:style/Theme.Material.NoActionBar" />
 
         <activity
             android:name=".PermissionRequestTransparentActivity"

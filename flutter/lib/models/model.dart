@@ -39,6 +39,8 @@ import 'package:file_picker/file_picker.dart';
 import 'package:vector_math/vector_math.dart' show Vector2;
 
 import '../common.dart';
+import '../mobile/xr/xr_session.dart';
+import '../mobile/xr/xr_video.dart';
 import '../utils/image.dart' as img;
 import '../common/widgets/dialog.dart';
 import 'input_model.dart';
@@ -330,6 +332,7 @@ class FfiModel with ChangeNotifier {
   // todo: why called by two position
   StreamEventHandler startEventListener(SessionID sessionId, String peerId) {
     return (evt) async {
+      XrSession.onEvent?.call(sessionId.toString(), evt);
       var name = evt['name'];
       if (name == 'msgbox') {
         handleMsgBox(evt, sessionId, peerId);
@@ -4290,6 +4293,11 @@ class FFI {
           // Fetch the image buffer from rust codes.
           final sz = platformFFI.getRgbaSize(sessionId, display);
           if (sz == 0) {
+            platformFFI.nextRgba(sessionId, display);
+            return;
+          }
+          if (isAndroid && XrVideo.renderFrame(sessionId.toString(), display, sz)) {
+            onEvent2UIRgba();
             platformFFI.nextRgba(sessionId, display);
             return;
           }

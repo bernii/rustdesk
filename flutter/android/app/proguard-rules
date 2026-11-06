@@ -5,3 +5,5 @@
 
 # Keep rustls-platform-verifier classes for JNI
 -keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }
+
+-keep class com.carriez.flutter_hbb.xr.XrRenderer { *; }

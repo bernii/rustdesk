@@ -25,6 +25,8 @@ import '../../models/shortcut_model.dart';
 import '../../utils/image.dart';
 import '../widgets/dialog.dart';
 import '../widgets/custom_scale_widget.dart';
+import '../xr/xr_controller.dart';
+import '../xr/xr_remote_view.dart';
 
 final initText = '1' * 1024;
 
@@ -88,6 +90,11 @@ class RemotePage extends StatefulWidget {
 }
 
 class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
+  XrController? _xr;
+  void _refreshXr() {
+    if (mounted) setState(() {});
+  }
+
   Timer? _timer;
   bool _showBar = !isWebDesktop;
   bool _showGestureHelp = false;
@@ -122,6 +129,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    if (isAndroid) {
+      _xr = XrController(gFFI)..addListener(_refreshXr);
+    }
     gFFI.ffiModel.updateEventListener(sessionId, widget.id);
     gFFI.start(
       widget.id,
@@ -159,6 +169,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       // side effect of registering callbacks (inside toolbarControls) is
       // what we want here.
       if (mounted) {
+        _xr?.begin();
         toolbarControls(context, widget.id, gFFI);
         // Mobile has no DesktopTabController, so tab-switch shortcuts will
         // log a no-handler debug line if a user binds one.
@@ -186,6 +197,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   @override
   Future<void> dispose() async {
+    _xr?.removeListener(_refreshXr);
+    _xr?.dispose();
     HardwareKeyboard.instance.removeHandler(_handleLocalKeyEvent);
     WidgetsBinding.instance.removeObserver(this);
     // Close the session up-front. `gFFI.close()` below only calls `sessionClose`
@@ -490,6 +503,33 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    if (_xr?.active == true) {
+      return RawKeyFocusScope(
+        focusNode: _physicalFocusNode,
+        inputModel: inputModel,
+        child: XrRemoteView(
+          controller: _xr!,
+          toolbar: _showBar ? getBottomAppBar() : IconButton(
+            icon: const Icon(Icons.expand_less),
+            onPressed: () => setState(() => _showBar = true),
+          ),
+          openKeyboard: openKeyboard,
+          close: () => clientClose(sessionId, gFFI),
+          keyboard: SizedBox(width: 0, height: 0, child: !_showEdit
+              ? const SizedBox()
+              : TextFormField(
+                  textInputAction: TextInputAction.newline,
+                  autocorrect: false,
+                  autofocus: true,
+                  focusNode: _mobileFocusNode,
+                  maxLines: null,
+                  controller: _textController,
+                  keyboardType: TextInputType.multiline,
+                  onChanged: handleSoftKeyboardInput,
+                )),
+        ),
+      );
+    }
     final keyboardIsVisible =
         keyboardVisibilityController.isVisible && _showEdit;
     final showActionButton = !_showBar || keyboardIsVisible || _showGestureHelp;
@@ -827,6 +867,21 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     final y = size.height;
     final mobileActionMenus = _getMobileActionMenus();
     final menus = toolbarControls(context, id, gFFI);
+    if (_xr != null) {
+      menus.add(TTextMenu(
+        child: Text(_xr!.enabled ? 'Disable XR mode' : 'Enable XR mode'),
+        onPressed: _xr!.toggleEnabled,
+      ));
+      if (_xr!.enabled && !_xr!.active) {
+        menus.add(TTextMenu(
+          child: const Text('Show in external display'),
+          onPressed: () {
+            _xr!.reopen();
+            if (!_xr!.available) showToast('Connect an external display to use XR mode');
+          },
+        ));
+      }
+    }
 
     final List<PopupMenuEntry<int>> more = [
       ...mobileActionMenus
