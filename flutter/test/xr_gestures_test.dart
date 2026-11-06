@@ -113,6 +113,65 @@ void main() {
     }
   });
 
+  test('three-finger movement drags and lifting a finger drops without a click',
+      () {
+    final events = <String>[];
+    final gestures = XrGestures(
+        move: (_) => events.add('move'),
+        scroll: (_) => events.add('scroll'),
+        zoom: (_) => events.add('zoom'),
+        button: (secondary, down) => events.add('$secondary:$down'),
+        dictate: () => events.add('dictate'),
+        isDictating: () => false,
+        stopDictation: () {},
+        finishDictation: (_) {});
+    gestures.begin(Offset.zero, 0);
+    gestures.update(2, const Offset(20, 0), 40, 10);
+    gestures.update(3, const Offset(40, 0), 0, 20);
+    gestures.update(3, const Offset(43, 0), 0, 30);
+    expect(events, isEmpty);
+    gestures.update(3, const Offset(48, 0), 0, 40);
+    gestures.update(3, const Offset(58, 0), 0, 50);
+    expect(events, ['false:true', 'move', 'move']);
+    gestures.update(2, const Offset(80, 0), 40, 60);
+    gestures.update(2, const Offset(100, 0), 40, 70);
+    gestures.update(1, const Offset(120, 0), 0, 80);
+    gestures.update(1, const Offset(140, 0), 0, 90);
+    expect(gestures.end(100), isFalse);
+    gestures.flushSecondaryTap(1000);
+    expect(events, ['false:true', 'move', 'move', 'false:false']);
+  });
+
+  test('drag releases on cancel or end and never carries scroll momentum', () {
+    for (final cancel in [false, true]) {
+      final buttons = <String>[];
+      final gestures = XrGestures(
+          move: (_) {},
+          scroll: (_) {},
+          zoom: (_) {},
+          button: (secondary, down) => buttons.add('$secondary:$down'),
+          dictate: () {},
+          isDictating: () => false,
+          stopDictation: () {},
+          finishDictation: (_) {});
+      gestures.begin(Offset.zero, 0);
+      gestures.update(2, Offset.zero, 40, 10);
+      gestures.update(2, const Offset(20, 0), 40, 20);
+      gestures.update(3, Offset.zero, 0, 30);
+      gestures.update(3, const Offset(10, 0), 0, 40);
+      if (cancel) gestures.cancel();
+      expect(gestures.end(50), isFalse);
+      gestures.cancel();
+      expect(buttons, ['false:true', 'false:false']);
+      expect(gestures.velocity, Offset.zero);
+      gestures.begin(Offset.zero, 1000);
+      gestures.update(3, Offset.zero, 0, 1010);
+      gestures.end(1020);
+      gestures.flushSecondaryTap(2000);
+      expect(buttons, ['false:true', 'false:false']);
+    }
+  });
+
   test('fit includes the desktop and 1:1 pan reaches every source edge', () {
     const source = Size(3840, 2160), output = Size(2560, 1080);
     final fitted = xrViewport(source, output, true, Offset.zero);

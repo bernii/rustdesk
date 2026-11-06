@@ -514,3 +514,5 @@ This is an ongoing repository workflow, not an automatic background monitor. Ano
 - **2026-11-06:** Deployed the input/calibration follow-up to Pixel 9 via wireless ADB with app data preserved. Installed APK SHA-256 matches the tested artifact; MainActivity cold launch succeeded. This verifies installation/startup only, not on-head calibration or microphone/remote-input behavior.
 
 - **2026-11-06:** Made the existing persisted phone trackpad-sensitivity slider prominent (0.5–8×, control lock preserved). Accept/discard now immediately hides the dictation preview; pending final recognition still supplies the accepted text without redisplaying it. This changes XR phone controls/preview state only, not tracking or projection.
+
+- **2026-11-06:** Added explicit three-finger remote dragging at user request: movement holds the left button, lifting any finger drops, and cancellation releases. One-finger hold/tap dragging remains disabled. Phone gesture handling only; no tracking/projection or portable-module changes, and no new hardware validation.

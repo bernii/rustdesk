@@ -2,7 +2,7 @@ import 'dart:math' as math;
 import 'dart:ui';
 import 'xr_dictation.dart';
 
-/// Touch-glass acceleration and scroll arbitration, without either drag gesture.
+/// Touch-glass acceleration, two-finger scrolling and explicit three-finger drag.
 class XrGestures {
   XrGestures(
       {required this.move,
@@ -25,6 +25,7 @@ class XrGestures {
   double _span = 0, _startSpan = 0, _speed = -1;
   bool _moved = false, _pinching = false, _scrolling = false;
   bool _dictationGesture = false, _dictationResolved = false;
+  bool _dragging = false;
   Offset velocity = Offset.zero;
 
   static double gain(double speed) {
@@ -43,11 +44,18 @@ class XrGestures {
 
   void update(int fingers, Offset position, double span, int time) {
     if (fingers != _count) {
+      _releaseDrag();
       _count = fingers;
       _maxCount = math.max(_maxCount, fingers);
       _position = _start = position;
       _span = _startSpan = span;
       _previous = time;
+      if (fingers >= 3) {
+        _secondaryTap = -1;
+        _moved = _scrolling = _pinching = _dictationGesture = false;
+        _speed = -1;
+        velocity = Offset.zero;
+      }
       if (fingers == 2 &&
           _maxCount == 2 &&
           isDictating() &&
@@ -72,9 +80,14 @@ class XrGestures {
     }
     final delta = position - _position;
     final distance = (position - _start).distance;
-    if (_count == 1 && _maxCount == 1) {
+    if ((_count == 1 && _maxCount == 1) ||
+        (_count == 3 && _maxCount == 3)) {
       if (distance > 5) _moved = true;
       if (_moved) {
+        if (_count == 3 && !_dragging) {
+          _dragging = true;
+          button(false, true);
+        }
         final speed = delta.distance / math.max(1, time - _previous);
         _speed = _speed < 0 ? speed : _speed * .6 + speed * .4;
         move(delta * gain(_speed));
@@ -138,10 +151,17 @@ class XrGestures {
   }
 
   void _reset() {
+    _releaseDrag();
     _count = _maxCount = 0;
     _moved = _pinching = _scrolling = false;
     _dictationGesture = _dictationResolved = false;
     _speed = -1;
+  }
+
+  void _releaseDrag() {
+    if (!_dragging) return;
+    _dragging = false;
+    button(false, false);
   }
 }
 

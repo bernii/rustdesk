@@ -248,7 +248,7 @@ class _XrRemoteViewState extends State<XrRemoteView>
                           style: TextStyle(fontSize: 28, color: brown)),
                       SizedBox(height: 8),
                       Text(
-                          'One finger to move · tap to click\nTwo fingers to scroll or right-click\nTwo-finger double-tap to dictate\nThird tap: release to send · pinch in: Enter\nPinch out: discard dictation',
+                          'One finger to move · tap to click\nTwo fingers to scroll or right-click\nThree fingers to drag · lift a finger to drop\nTwo-finger double-tap to dictate\nThird tap: release to send · pinch in: Enter\nPinch out: discard dictation',
                           textAlign: TextAlign.center,
                           style: TextStyle(color: brown, height: 1.6)),
                     ]))))),

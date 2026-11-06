@@ -51,6 +51,13 @@ only the package changed. Mac source was inspected, not changed.
   repeats for a source-monitor change. Ordinary metadata updates do not recenter.
 - Both 450 ms hold-to-drag and tap-then-move dragging are removed from the XR pad.
   Taps still produce immediate down/up click pairs; double-clicks remain possible.
+- Subsequent requested gesture: move three fingers together to hold the remote
+  left button and drag with the existing pointer acceleration/sensitivity. The
+  gesture starts after 5 dp of centroid travel; placing fingers alone does not
+  click. Lifting any finger drops immediately. Remaining fingers cannot click or
+  scroll until the touch sequence ends. Cancellation/teardown releases the button;
+  entering three-finger mode clears pending right-click and scroll momentum.
+  One-finger hold and tap-then-move dragging remain disabled.
 - Touch-glass's smoothed pointer speed (`0.6 previous + 0.4 current`) now drives its
   existing 0.25–3× smooth gain curve, then RustDesk's saved sensitivity multiplier.
 - The follow-up sensitivity bar is prominently placed beneath the phone's source
@@ -120,6 +127,14 @@ The previously documented optional sharp-edge/checker stress limitations remain;
 the default geometry-suite pass does not supersede them.
 
 ## Regression surface
+
+Three-finger drag follow-up (6 November): changes are confined to
+`xr_gestures.dart` (explicit left-button hold/release and gesture arbitration),
+`xr_remote_view.dart` (gesture help), and two regression tests in
+`xr_gestures_test.dart`. This uses the existing remote mouse path and does not
+change native tracking/rendering or other platform input. XR analysis is clean;
+14 focused gesture/dictation/control tests pass. No new APK deployment or physical
+remote-drag measurement is claimed for this source change.
 
 Subsequent slider/preview update (6 November): analysis clean; 12 existing focused
 XR controls/gestures/dictation tests passed, including immediate preview dismissal
