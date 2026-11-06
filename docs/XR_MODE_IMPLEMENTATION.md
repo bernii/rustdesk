@@ -1,5 +1,51 @@
 # rustdesk-xr Android integration
 
+## 6 November 2026 upstream refresh
+
+The XR integration is committed and rebased onto upstream master
+`9382ab2607d3262e17492f004664ec47f5db1f9f`. The original commit is preserved by
+`backup/xr-before-rebase-20261106`. The rebase required no conflict resolution or
+XR runtime changes. The submodule follows upstream at
+`fae47e024dd83cef6aaecde0aa7d11731df11649` (trusted-device configuration and UDP
+send recovery changes).
+
+The restored generated bridge and ARM64 Rust library come from upstream master
+`fdffc37bb067d14389350937effa3269b52b656d`, CI run `42147569859`. Its application
+source is identical to the new base: the intervening commit only changes
+`.github/workflows/flutter-build.yml`. Artifact provenance:
+
+- [Generated bridge](https://nightly.link/rustdesk/rustdesk/actions/artifacts/13471667176.zip),
+  SHA-256 `fe651af8704fefa9b0f2fc68e2722ca61acb28f118a05e90f06484779baea616`.
+- [ARM64 Rust library](https://nightly.link/rustdesk/rustdesk/actions/artifacts/13473200051.zip),
+  SHA-256 `db6a8828cb71b280caaaf4645852255385e6f48cc4757aba4c13a1e45645ff59`.
+
+Flutter 3.24.5 was restored at `/private/tmp/rustdesk-xr-tools/flutter`, including
+the dropdown-menu patch used by Android CI. This refresh uses the installed JDK
+21.0.13 at `/Users/berni/.gradle/jdks/jdk-21.0.13+9/Contents/Home`, Rust 1.99.0 for
+Cargo metadata, and the existing Android SDK/NDK/CMake versions below. Dependency
+resolution leaves the tracked lockfile unchanged. XR analysis passes, and all
+37 focused XR/input/cursor tests pass. Logs are in `build/xr-validation/20261106/`.
+
+The ARM64 debug APK built successfully and was installed with `adb install -r`
+over USB on the Pixel 9, preserving app data. Cold launch completed in 2.35 seconds;
+the process remained running and the sampled launch log contained no fatal,
+Flutter, or native-linker errors. Installed package: `dev.rustdesk.xr`, version
+1.5.1, version code 2068. This verifies startup, not an end-to-end remote XR session.
+The deliverable is `build/rustdesk-xr-arm64-debug.apk`, SHA-256
+`f3630a6156ef2ecd8372884650b2572eea4e99bca0c97383307439170d58fedb`.
+
+Refresh regression surface: no XR runtime code changed during the rebase.
+`flutter/android/.gitignore` additionally excludes the Kotlin build cache generated
+by this build; this has no runtime effect. The existing integration hooks and their
+necessity are listed in the regression-surface section below. Android lint was not
+rerun for this refresh; the original lint findings below are historical.
+
+There is still no IMU or head-tracking implementation. The 1:1 viewport is panned
+manually using sliders. The following sections record the original implementation
+and device experiments; their artifact IDs and temporary tool paths are historical.
+
+## Original implementation checkpoint
+
 Implementation checkpoint: 23 October 2026, based on upstream
 `828d1101afd2e656eb1c1d18511009bdf5336238` and [the probe handoff](../../rustdesk-xr-probe/docs/XR_MODE_HANDOFF.md).
 This is the real Flutter RustDesk client, with its existing Rust connection and decoder.

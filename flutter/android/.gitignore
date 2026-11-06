@@ -12,4 +12,5 @@ key.properties
 
 # Android native build intermediates and Gradle diagnostics
 **/.cxx/
+/.kotlin/
 /build/
