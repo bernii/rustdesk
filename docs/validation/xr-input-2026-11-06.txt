@@ -1,0 +1,33 @@
+XR input/calibration follow-up — 2026-11-06
+
+Artifact: build/rustdesk-xr-arm64-input-calibration-debug.apk
+SHA-256: 9448685392ab43dfaaca9ea87ebfe249b8f5ff4ee320bd34d39d5f6881eba111
+Deployment: Pixel 9, wireless ADB install -r succeeded, app data preserved.
+MainActivity cold launch: Status ok, TotalTime 2609 ms.
+Installed base.apk SHA-256 matches the artifact above.
+Installation/startup verified; live worn/speech/remote-input checks pending.
+
+Probe JVM suite: 122 tests passed.
+Portable extraction: 72 tests passed; renamed-package javac and API-26 dex passed.
+Canonical export --check and destination package-only equality: passed.
+Flutter focused XR/input/cursor suite: 43 tests passed.
+Flutter XR analysis: no issues.
+Android ARM64 debug app + instrumentation APK: assembled successfully.
+Android lint: five existing errors in untouched Kotlin code; no XR errors.
+
+API-33 ARM64 emulator, SwiftShader:
+PASS: 18 GPU projection cases, 73204 pixels; BGRA, 1:1 coordinates,
+rotations, edges, HUD and cursor; 2 dictation overlay layouts.
+Preview PNGs at 1920x1200 and 2560x1080 visually inspected after word-wrap fix.
+Optional strict sharp-edge/checker filtering failures from the earlier projection
+validation remain known limits; this run uses the default smooth-ramp suite.
+
+Synthetic worn recovery: 10 s sustained yaw followed by gentle tilted motion.
+Before: no confirmation by 19 s. After: confirmation at 16 s (6 s after settling).
+Existing 2/4/6-second reversible sway: confirmations at 25/25/37 s;
+bias error approximately 5.645e-6 / 7.620e-6 / 1.422e-5 rad/s.
+These are synthetic results, not live worn measurements.
+
+Hardware checks pending: worn convergence, speech service/microphone final results,
+optical preview visibility, remote text/Enter delivery, USB/network lifecycle.
+Logs and preview images: build/xr-validation/20261106-input/ (local artifacts).

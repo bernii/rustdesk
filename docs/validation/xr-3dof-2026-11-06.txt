@@ -1,0 +1,39 @@
+RustDesk 3DoF integration validation — 2026-11-06
+Context: Android 13 ARM64 Pixel 6 AVD, SwiftShader. No physical glasses.
+
+
+PASS: 18 GPU projection cases, 73204 pixels; BGRA, 1:1 coordinates, rotations, edges, HUD and cursor.
+
+
+Strict rotated wrap-edge stress (highp samplers did not resolve it):
+
+FAIL: java.lang.AssertionError: pixel 609,7 channel 1 expected 31 got 34 case 1
+	at com.carriez.flutter_hbb.xr.XrProjectionInstrumentation.check(XrProjectionInstrumentation.java:131)
+	at com.carriez.flutter_hbb.xr.XrProjectionInstrumentation.runChecks(XrProjectionInstrumentation.java:78)
+	at com.carriez.flutter_hbb.xr.XrProjectionInstrumentation.onStart(XrProjectionInstrumentation.java:21)
+	at android.app.Instrumentation$InstrumentationThread.run(Instrumentation.java:2361)
+
+
+Strict checkerboard stress, with unchanged flat renderer baseline:
+
+FAIL: java.lang.AssertionError: 1:1 checkerboard at 3,3 expected 0 got 8; unchanged flat shader got 8
+	at com.carriez.flutter_hbb.xr.XrProjectionInstrumentation.check(XrProjectionInstrumentation.java:174)
+	at com.carriez.flutter_hbb.xr.XrProjectionInstrumentation.runChecks(XrProjectionInstrumentation.java:136)
+	at com.carriez.flutter_hbb.xr.XrProjectionInstrumentation.onStart(XrProjectionInstrumentation.java:28)
+	at android.app.Instrumentation$InstrumentationThread.run(Instrumentation.java:2361)
+
+
+Starting: Intent { cmp=dev.rustdesk.xr/com.carriez.flutter_hbb.MainActivity }
+Status: ok
+LaunchState: COLD
+Activity: dev.rustdesk.xr/com.carriez.flutter_hbb.MainActivity
+TotalTime: 3110
+WaitTime: 3169
+Complete
+
+App remained running; emulator crash buffer empty.
+Builds: ARM64 debug app and instrumentation APK passed.
+Flutter: 38 focused tests passed; XR analysis no issues.
+Portable: 71 tests, standalone compile and API-26 dex passed.
+Lint: zero XR errors; five errors in untouched Kotlin files (see integration record).
+APK SHA-256: 8436dac7a54cf94800fc93e5de5e64923426a0c36167ed3ffdd8c3d663d56188
