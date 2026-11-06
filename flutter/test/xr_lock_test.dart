@@ -9,6 +9,12 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:uuid/uuid.dart';
 
 class _Input extends Fake implements InputModel {
+  final moves = <Offset>[];
+  @override
+  Future<void> moveMouse(double x, double y) async {
+    moves.add(Offset(x, y));
+  }
+
   @override
   bool get isViewCamera => false;
   @override
@@ -79,6 +85,16 @@ void main() {
   Finder getLock() =>
       find.bySemanticsLabel('Hold for two seconds to unlock controls');
 
+  test('starting XR sends the centered cursor to the remote host once',
+      () async {
+    await controller.begin();
+    final input = controller.ffi.inputModel as _Input;
+    expect(input.moves, [const Offset(1920, 1080)]);
+    expect(controller.pointer, const Offset(1920, 1080));
+    controller.ffi.ffiModel.notifyListeners();
+    expect(input.moves, hasLength(1));
+  });
+
   testWidgets('full source buffer can be compared with output-sized rendering',
       (tester) async {
     final overlays = <Map>[];
@@ -92,6 +108,10 @@ void main() {
       return null;
     });
     await show(tester);
+    expect(find.text('3DoF: on'), findsOneWidget);
+    expect(overlays.last['anchored'], isTrue);
+    controller.toggleAnchored();
+    await tester.pump();
     expect(find.text('Full-res buffer: on'), findsOneWidget);
     expect(overlays.last['fullSourceBuffer'], isTrue);
     controller.locked = false;
@@ -108,6 +128,40 @@ void main() {
     await tester.pump();
     expect(overlays.last['fullSourceBuffer'], isTrue);
     expect(overlays.last['fit'], isTrue);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets(
+      '3DoF starts by default and exposes separate calibration controls',
+      (tester) async {
+    final calls = <MethodCall>[];
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(channel,
+        (call) async {
+      calls.add(call);
+      if (call.method == 'begin')
+        return {'active': true, 'enabled': true, 'available': true};
+      return null;
+    });
+    await show(tester);
+    controller.setLocked(false);
+    await tester.pump();
+    expect(find.text('3DoF: on'), findsOneWidget);
+    expect(find.text('Full-res buffer: on'), findsNothing);
+    expect(find.text('Horizontal viewport'), findsNothing);
+    await tester.tap(find.text('Recenter'));
+    await tester.tap(find.text('Recheck'));
+    await tester.tap(find.text('Desk calibration'));
+    await tester.pumpAndSettle();
+    expect(
+        calls.where((call) => call.method == 'calibrateStationary'), isEmpty);
+    await tester.tap(find.text('Start'));
+    await tester.pumpAndSettle();
+    expect(calls.where((call) => call.method == 'recenter'), hasLength(1));
+    expect(calls.where((call) => call.method == 'recheckCalibration'),
+        hasLength(1));
+    expect(calls.where((call) => call.method == 'calibrateStationary'),
+        hasLength(1));
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
   });

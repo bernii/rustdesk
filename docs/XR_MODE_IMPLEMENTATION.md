@@ -1,5 +1,7 @@
 # rustdesk-xr Android integration
 
+**Follow-up deployed to Pixel 9 (6 November 2026):** [calibration, cursor and dictation changes](XR_INPUT_AND_CALIBRATION_2026_11_06.md). This supersedes the original drag and immediate-final-text dictation behavior below.
+
 ## 6 November 2026 upstream refresh
 
 The XR integration is committed and rebased onto upstream master
@@ -40,9 +42,139 @@ by this build; this has no runtime effect. The existing integration hooks and th
 necessity are listed in the regression-surface section below. Android lint was not
 rerun for this refresh; the original lint findings below are historical.
 
-There is still no IMU or head-tracking implementation. The 1:1 viewport is panned
-manually using sliders. The following sections record the original implementation
-and device experiments; their artifact IDs and temporary tool paths are historical.
+## 6 November 2026 live 3DoF integration
+
+This supersedes the manual-only tracking status in the refresh above. The current
+viewer starts in **3DoF** when the first remote frame opens XR, or when the glasses
+are connected during an existing session. XR must be enabled; explicit Exit XR or
+manual viewer close still suppresses automatic reopening.
+
+Use XREAL 1S **Follow**, **Stabilizer off**, **TCP/IP enabled**. The phone keeps its
+normal Internet route; the copied tracker binds only its own sockets to the glasses'
+USB Ethernet network. Tracking and worn calibration start automatically. The glasses
+show the probe's projected amber learning ring, teal refining state, or gray missing
+IMU state. The card disappears after fresh, confirmed calibration. Saved bias is
+reconfirmed on reconnect. This app has its own private profiles; the probe's learned
+calibration is not transferred.
+
+The 4K remote desktop remains a cached GPU texture. The new GLES2 ray/plane shader
+renders into the output-sized surface (for example 1920×1200). Centered distance 1
+is 1:1; turn your head to reveal the rest of the desktop. FOV defaults to 45° and
+prediction is off. This does not negotiate a 4K physical signal. Both actual output
+and buffer dimensions remain visible on the phone. New remote frames retain the
+existing synchronous BGRA mailbox copy/upload; there is no CPU reprojection or
+per-frame bitmap conversion. Head motion redraws even when remote content is idle.
+Cursor position, hotspot and shape use the same projection as the remote pixels.
+
+Unlock the phone controls with the existing two-second hold:
+
+- **Recenter** changes the viewing reference, retaining calibration.
+- **Recheck** keeps useful tracking/bias while validating independent intervals.
+- **Desk calibration** first asks you to place the glasses on a stable surface,
+  then runs the probe's explicit two-interval stale-bias recovery. It never runs
+  automatically as a substitute for ordinary worn calibration.
+- **3DoF: on/off** returns to the existing fit, manual 1:1 pan and full-source-buffer
+  controls. These flat comparison settings do not resize the 3DoF render surface.
+- **Clear text** remains available on the phone. The flat mode's head-locked Clear
+  target is hidden in 3DoF so it cannot consume remote clicks under a different mapping.
+
+Transport stops on viewer pause/close, session end, backgrounding and display
+removal. The controller retains tracker ownership across GL surface recreation.
+The renderer freezes the last good pose on stale/missing IMU and shows the missing
+motion-data card; it never extrapolates old data. A shader/upload failure reports
+an error and returns to the ordinary phone view.
+
+Source: `flutter/android/app/src/main/java/com/carriez/flutter_hbb/xr/Xreal3Dof.java`
+is the portable probe export with **only its package declaration changed**. Preserve
+its embedded notices. To update it, regenerate/check the canonical probe export,
+copy it again with the destination package and run the portable verification and
+fork tests. Do not edit the copied bundled internals independently. The destination
+build now compiles app Java/Kotlin at JVM 17 for records/text blocks; minSdk remains
+22 and the external XR activity remains gated to API 29+.
+
+The [Android/XREAL handoff](ANDROID_XREAL_3DOF_PORTING_GUIDE.md) carries the estimator,
+calibration and projection contracts. Keep it synchronized with the canonical
+workspace guide when updating the integration.
+
+Validation (6 November 2026):
+
+- ARM64 debug app and test APK builds pass; native compilation retains `-Wall -Wextra -Werror`.
+- Focused Flutter XR/input/cursor tests: **38 pass**. XR Dart analysis: no issues.
+- Canonical export check, standalone compile/API-26 dex, and **71 portable tests pass**.
+  The destination copy differs only in its package declaration. The facade now
+  explicitly annotates its pre-existing API-26 runtime requirement.
+- Android 13 ARM64 emulator / SwiftShader: **18 GPU cases, 73,204 pixel comparisons
+  pass**, covering BGRA, centered source coordinates, yaw/pitch/roll/mixed poses,
+  looking away/plane edges, 4K and smaller sources, HUD phases and cursor composition.
+  The geometry suite uses continuous ramps and a two-channel-value tolerance.
+- **Strict filtering stress checks still fail on this emulator.** `-e sharp true`
+  reproduces a rotated wrap-edge channel mismatch (expected 31, actual 34 at
+  output 609,7). Explicit highp samplers made no difference and were reverted.
+  `-e checker true` reproduces centered one-pixel-checker filtering (expected 0,
+  actual 8 at 3,3). Crucially, the **unchanged native flat shader also produces 8**
+  for the same checker. These are separate retained stress tests, not waived passes;
+  the exact optical/physical-GPU behavior remains unverified. Tolerances were not
+  widened to conceal the failures.
+- Android lint: **zero XR errors**, five errors in untouched `AudioRecordHandle.kt`,
+  `DocumentLogs.kt`, `MainService.kt` (two), and `RdClipboardManager.kt`.
+- Emulator install/cold launch succeeds (3.110 s), process remains running and
+  the crash buffer is empty. This is not a real remote-session or glasses test.
+
+The deliverable is `build/rustdesk-xr-arm64-3dof-debug.apk`, SHA-256
+`8436dac7a54cf94800fc93e5de5e64923426a0c36167ed3ffdd8c3d663d56188`.
+Compact evidence is in [the validation record](validation/xr-3dof-2026-11-06.txt);
+full local build/test/lint logs are in ignored `build/xr-validation/20261106-3dof/`.
+Reproduce GPU checks with the Gradle build setup below, adding
+`:app:assembleDebugAndroidTest`, then install app and test APKs and run:
+
+```sh
+adb -s DEVICE shell am instrument -w \
+  dev.rustdesk.xr.test/com.carriez.flutter_hbb.xr.XrProjectionInstrumentation
+# Retained strict stress checks, separately:
+adb -s DEVICE shell am instrument -w -e sharp true \
+  dev.rustdesk.xr.test/com.carriez.flutter_hbb.xr.XrProjectionInstrumentation
+adb -s DEVICE shell am instrument -w -e checker true \
+  dev.rustdesk.xr.test/com.carriez.flutter_hbb.xr.XrProjectionInstrumentation
+```
+
+Inspect the runner's PASS/FAIL text; shell status alone is insufficient.
+No physical phone/glasses was attached during this work. Optical quality, live
+calibration, stationary/on-head drift, reconnect/endurance and 4K decoder load
+remain device acceptance work. The probe's previous physical measurements do not
+validate this new RustDesk content/lifecycle path. The renderer uses coalesced
+Choreographer redraw requests, not the probe's EGL presentation-feedback scheduler;
+no motion-to-photon or performance improvement is claimed.
+
+Follow-up deployment, 6 November 2026: installed the 3DoF APK above on the
+user's Pixel 9 over Wi-Fi debugging with `adb install -r`, preserving app data.
+Package verification reports version 1.5.1 / code 2068; cold launch returned OK
+in 3.363 s and the app process remained running. This confirms installation and
+startup only; no remote-session, glasses calibration or optical measurement was
+performed in this deployment step.
+
+Regression surface for this change:
+
+- `XrViewerActivity.java`: default 3DoF branch, output-sized buffer, pose redraws,
+  tracker lifecycle and status ticks are necessary for head tracking with idle video.
+- `XrController.java`: owns tracker, stops transport on XR/session/display teardown,
+  routes three explicit controls and a separate 2 Hz tracking event. Tracking events
+  do not resend session/cursor state or reconfigure video.
+- `XrRenderer.java` / `cpp/xr/renderer.cpp`: additive JNI upload accessor exposes the
+  existing owned texture to the Java GL projection pass. The old flat draw function
+  is unchanged; its small upload block is deliberately duplicated for this new path.
+- `XrOverlay.java`: skips the flat cursor and Clear target in 3DoF because the cursor
+  is now projected on the GPU. Lock/dictation overlays retain their existing behavior.
+- Dart `xr_controller.dart` / `xr_remote_view.dart`: 3DoF default, controls/status,
+  flat comparison visibility, and bypass of flat Clear hit testing in 3DoF. Relative
+  remote input remains in source pixels; the source monitor origin is unchanged.
+- Android app/root Gradle files: app Java/Kotlin 17 compatibility and the dependency-free
+  GPU instrumentation runner. Plugin JVM targets and ordinary Android minSdk stay unchanged.
+- New tracker, projection renderer and tests are XR-specific. No Rust, decoder,
+  protocol, generated bridge, submodule, or ordinary mobile video path changes.
+
+The following original implementation sections are **historical** unless explicitly
+updated above; their manual-only tracking limitations and full-resolution-buffer
+default describe the old flat renderer, not the new 3DoF default.
 
 ## Original implementation checkpoint
 

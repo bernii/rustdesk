@@ -4,12 +4,14 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import java.util.ArrayList;
 
-/** One foreground utterance at a time; no automatic restart or retained audio. */
+/** Foreground dictation until stopped; completed utterances remain a local preview. */
 final class DictationController {
     interface Sink {
         void text(String value, boolean complete);
@@ -20,6 +22,9 @@ final class DictationController {
     private final Context context;
     private final Sink sink;
     private SpeechRecognizer recognizer;
+    private boolean wanted;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Runnable restart = this::listen;
 
     DictationController(Context context, Sink sink) {
         this.context = context;
@@ -29,10 +34,16 @@ final class DictationController {
     boolean active() { return recognizer != null; }
 
     void start() {
-        if (active()) return;
+        if (wanted) return;
+        wanted = true;
+        listen();
+    }
+
+    private void listen() {
+        if (!wanted || active()) return;
         boolean local = Build.VERSION.SDK_INT >= 31 && SpeechRecognizer.isOnDeviceRecognitionAvailable(context);
         if (!local && !SpeechRecognizer.isRecognitionAvailable(context)) {
-            sink.status("Speech recognition unavailable. Use Keys → Gboard microphone.", false);
+            finish("Speech recognition unavailable. Use Keys → Gboard microphone.");
             return;
         }
         try {
@@ -46,8 +57,10 @@ final class DictationController {
                     ArrayList<String> values = results == null ? null
                             : results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
                     if (values != null && !values.isEmpty()) sink.text(values.get(0), complete);
-                    if (complete) finish(values == null || values.isEmpty()
-                            ? "No words recognized. Tap mic to retry." : "Dictation complete");
+                    if (complete) {
+                        if (wanted) continueListening();
+                        else finish("Dictation ready");
+                    }
                 }
                 @Override public void onReadyForSpeech(Bundle params) {
                     if (current()) {
@@ -64,7 +77,12 @@ final class DictationController {
                         sink.status("Finishing dictation…", true);
                     }
                 }
-                @Override public void onError(int error) { if (current()) finish(errorText(error)); }
+                @Override public void onError(int error) {
+                    if (!current()) return;
+                    if (wanted && (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)) {
+                        continueListening();
+                    } else finish(errorText(error));
+                }
                 @Override public void onResults(Bundle results) { result(results, true); }
                 @Override public void onPartialResults(Bundle results) { result(results, false); }
                 @Override public void onEvent(int event, Bundle params) {}
@@ -81,21 +99,37 @@ final class DictationController {
     }
 
     void stop() {
+        wanted = false;
+        handler.removeCallbacks(restart);
         if (recognizer != null) {
             sink.listening(false);
             sink.status("Finishing dictation…", true);
-            recognizer.stopListening();
-        }
+            try { recognizer.stopListening(); }
+            catch (RuntimeException error) { finish("Speech service stopped; preview kept"); }
+        } else finish("Dictation ready");
     }
 
     void cancel() {
-        if (recognizer != null) finish("Dictation stopped · preview kept");
+        if (wanted || recognizer != null) finish("Dictation stopped · preview kept");
     }
 
-    private void finish(String status) {
+    private void continueListening() {
+        releaseRecognizer();
+        sink.listening(false);
+        sink.status("Dictating · two-finger tap to finish", true);
+        handler.postDelayed(restart, 250);
+    }
+
+    private void releaseRecognizer() {
         SpeechRecognizer old = recognizer;
         recognizer = null;
         if (old != null) old.destroy();
+    }
+
+    private void finish(String status) {
+        wanted = false;
+        handler.removeCallbacks(restart);
+        releaseRecognizer();
         sink.listening(false);
         sink.status(status, false);
     }

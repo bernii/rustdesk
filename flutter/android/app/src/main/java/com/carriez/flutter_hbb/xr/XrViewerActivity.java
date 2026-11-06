@@ -20,6 +20,10 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
     private XrController owner;
     private GLSurfaceView video;
     private XrOverlay overlay;
+    private final XrProjectionRenderer projection = new XrProjectionRenderer();
+    private volatile boolean anchored = true;
+    private volatile boolean projectionReady;
+    private long lastStatus;
     private volatile int surfaceWidth, surfaceHeight;
     private volatile boolean fit = true;
     private volatile float panX = .5f, panY = .5f;
@@ -32,6 +36,8 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
             finish(); return;
         }
         owner.viewer = this;
+        anchored = !Boolean.FALSE.equals(owner.overlay.get("anchored"));
+        owner.tracking(anchored);
         if (Build.VERSION.SDK_INT >= 27) setTurnScreenOn(true);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON | WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
         fullscreen();
@@ -83,11 +89,13 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
         super.onResume();
         if (video != null) {
             video.onResume(); ticking = true;
+            owner.tracking(anchored);
             Choreographer.getInstance().postFrameCallback(this);
         }
     }
     @Override protected void onPause() {
         ticking = false;
+        if (owner != null && owner.viewer == this) owner.tracking(false);
         Choreographer.getInstance().removeFrameCallback(this);
         if (video != null) { XrRenderer.enable(false); video.onPause(); }
         super.onPause();
@@ -98,10 +106,14 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
     }
     @Override public void doFrame(long time) {
         if (!ticking || video == null) return;
-        if (XrRenderer.pending()) video.requestRender();
+        if (anchored || XrRenderer.pending()) video.requestRender();
+        if (anchored && time - lastStatus >= 500_000_000L) {
+            lastStatus = time; owner.reportTracking();
+        }
         Choreographer.getInstance().postFrameCallback(this);
     }
     @Override public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+        projectionReady = false;
         boolean ok = XrRenderer.initialize();
         XrRenderer.enable(ok);
         runOnUiThread(() -> {
@@ -115,15 +127,34 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
         runOnUiThread(() -> { if (owner.viewer == this) owner.report(); });
     }
     @Override public void onDrawFrame(GL10 gl) {
-        if (!XrRenderer.draw(surfaceWidth, surfaceHeight, fit, panX, panY)) {
+        if (surfaceWidth <= 0 || surfaceHeight <= 0) return;
+        Xreal3Dof tracker = owner.tracker;
+        boolean ok = anchored
+                ? initializeProjection() && tracker != null && projection.draw(surfaceWidth, surfaceHeight, tracker)
+                : XrRenderer.draw(surfaceWidth, surfaceHeight, fit, panX, panY);
+        if (!ok) {
             XrRenderer.enable(false);
             runOnUiThread(() -> {
                 if (owner.viewer == this) owner.failed("XR video upload failed. Returned to the phone screen.");
             });
         }
     }
+    private boolean initializeProjection() {
+        if (projectionReady) return true;
+        try {
+            projection.initialize(); projectionReady = true;
+            return true;
+        } catch (RuntimeException failure) {
+            android.util.Log.e("RustDeskXR", "3DoF shader initialization failed", failure);
+            return false;
+        }
+    }
     void refresh() {
         if (video == null) return;
+        boolean nextAnchored = !Boolean.FALSE.equals(owner.overlay.get("anchored"));
+        if (ticking) owner.tracking(nextAnchored);
+        anchored = nextAnchored;
+        projection.configure(owner.overlay);
         fit = !Boolean.FALSE.equals(owner.overlay.get("fit"));
         panX = number("panX", .5f); panY = number("panY", .5f);
         configureBuffer();
@@ -132,7 +163,7 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
     private void configureBuffer() {
         FrameLayout root = (FrameLayout) video.getParent();
         int width = (int) number("width", 0), height = (int) number("height", 0);
-        boolean fullSource = fit && Boolean.TRUE.equals(owner.overlay.get("fullSourceBuffer"))
+        boolean fullSource = !anchored && fit && Boolean.TRUE.equals(owner.overlay.get("fullSourceBuffer"))
                 && width > 0 && height > 0 && width <= 16384 && height <= 16384;
         int viewWidth = -1, viewHeight = -1;
         if (fullSource && root.getWidth() > 0 && root.getHeight() > 0) {
@@ -161,6 +192,7 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
         values.put("refreshRate", (double) mode.getRefreshRate());
         values.put("surfaceWidth", surfaceWidth); values.put("surfaceHeight", surfaceHeight);
         values.put("viewportWidth", overlay.getWidth()); values.put("viewportHeight", overlay.getHeight());
+        values.put("projection", anchored ? "3DoF · prediction off" : "Flat");
         values.put("density", (double) getResources().getDisplayMetrics().density);
     }
 }

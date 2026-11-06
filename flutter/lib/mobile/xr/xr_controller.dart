@@ -9,6 +9,7 @@ import '../../common.dart' show showToast;
 import 'xr_session.dart';
 import '../../models/model.dart';
 import 'xr_gestures.dart';
+import 'xr_dictation.dart';
 import 'xr_video.dart';
 
 class XrController extends ChangeNotifier {
@@ -23,13 +24,17 @@ class XrController extends ChangeNotifier {
   static const _channel = MethodChannel('rustdesk-xr');
   bool active = false, enabled = true, available = false, locked = true;
   bool listening = false, recognizing = false, holding = false, fit = true;
-  bool fullSourceBuffer = true;
+  bool fullSourceBuffer = true, anchored = true;
+  String trackingStatus = '';
   bool _disposed = false, _begun = false;
   double sensitivity = 3, density = 1;
   ui.Size output = ui.Size.zero, surface = ui.Size.zero;
   ui.Size viewportSize = ui.Size.zero;
   ui.Offset pan = const ui.Offset(.5, .5), pointer = ui.Offset.zero;
-  String status = '', transcript = '', _draft = '';
+  String status = '', transcript = '';
+  final XrDictation _dictation = XrDictation();
+  bool get dictating => _dictation.active;
+  bool _centerPending = true;
   final Set<bool> _buttons = {};
   bool _clearPressed = false;
   ui.Image? _cursorImage;
@@ -62,7 +67,7 @@ class XrController extends ChangeNotifier {
   }
 
   bool _localKey(KeyEvent event) {
-    if (active && event is KeyDownEvent && recognizing) cancelSpeech();
+    if (active && event is KeyDownEvent && dictating) cancelSpeech();
     return false;
   }
 
@@ -89,31 +94,36 @@ class XrController extends ChangeNotifier {
     final args = Map<String, dynamic>.from(call.arguments as Map);
     if (args['session'] != session) return;
     switch (call.method) {
+      case 'tracking':
+        trackingStatus = args['trackingStatus'] as String? ?? '';
+        notifyListeners();
+        break;
       case 'state':
         _state(args);
         break;
       case 'speech':
-        if (!recognizing || !canType) return;
-        final text = args['text'] as String? ?? '';
-        transcript = _draft + text;
-        if (args['complete'] == true) {
-          recognizing = false;
-          _draft = transcript;
-          if (text.isNotEmpty) {
-            await bind.sessionInputString(
-                sessionId: ffi.sessionId, value: text);
-          }
-        }
-        if (_disposed) return;
+        if (args['generation'] != _dictation.generation ||
+            !dictating ||
+            !canType) return;
+        _dictation.accept(args['text'] as String? ?? '',
+            complete: args['complete'] == true);
+        transcript = _dictation.preview;
         _overlay();
         notifyListeners();
         break;
       case 'speechStatus':
+        if (args['generation'] != _dictation.generation || !dictating) return;
         status = args['status'] as String? ?? '';
         recognizing = args['active'] == true;
+        if (!recognizing) {
+          _dictation.finish();
+          unawaited(_sendDictationIfReady());
+        }
+        _overlay();
         notifyListeners();
         break;
       case 'listening':
+        if (args['generation'] != _dictation.generation || !dictating) return;
         listening = args['listening'] == true;
         _overlay();
         notifyListeners();
@@ -133,6 +143,7 @@ class XrController extends ChangeNotifier {
     if (!active && next) {
       locked = true;
       holding = false;
+      _centerPending = true;
       pointer = ui.Offset(source.width / 2, source.height / 2);
     }
     active = next;
@@ -186,12 +197,18 @@ class XrController extends ChangeNotifier {
     if (rect != _source) {
       if (active) release();
       _source = rect;
+      _centerPending = true;
       pointer = ui.Offset(rect.width / 2, rect.height / 2);
     }
     if (active && !rect.isEmpty) {
       try {
         XrVideo.configure(session, pi.currentDisplay, rect.width.toInt(),
             rect.height.toInt());
+        if (_centerPending && canInput) {
+          _centerPending = false;
+          pointer = ui.Offset(rect.width / 2, rect.height / 2);
+          move(ui.Offset.zero);
+        }
       } catch (error) {
         status = 'XR video bridge unavailable: $error';
         active = false;
@@ -242,6 +259,7 @@ class XrController extends ChangeNotifier {
         'x': pointer.dx,
         'y': pointer.dy,
         'fit': fit,
+        'anchored': anchored,
         'fullSourceBuffer': fullSourceBuffer,
         'panX': pan.dx,
         'panY': pan.dy,
@@ -249,6 +267,8 @@ class XrController extends ChangeNotifier {
         'locked': locked,
         'holding': holding,
         'listening': listening,
+        'dictating': _dictation.previewVisible,
+        'dictationStopping': _dictation.stopping,
         'transcript': transcript,
       }
     }));
@@ -267,6 +287,7 @@ class XrController extends ChangeNotifier {
   }
 
   bool get _overClear {
+    if (anchored) return false;
     final viewport = xrViewport(source.size, viewportSize, fit, pan);
     if (viewport.isEmpty) return false;
     final position =
@@ -311,17 +332,29 @@ class XrController extends ChangeNotifier {
   }
 
   void toggleFit() {
+    anchored = false;
     fit = !fit;
     _overlay();
     notifyListeners();
   }
 
   void toggleFullSourceBuffer() {
+    anchored = false;
     fullSourceBuffer = !fullSourceBuffer;
     fit = true;
     _overlay();
     notifyListeners();
   }
+
+  void toggleAnchored() {
+    anchored = !anchored;
+    _overlay();
+    notifyListeners();
+  }
+
+  void recenter() => unawaited(_call('recenter'));
+  void recheckCalibration() => unawaited(_call('recheckCalibration'));
+  void calibrateStationary() => unawaited(_call('calibrateStationary'));
 
   void setPan(ui.Offset value) {
     pan = value;
@@ -358,17 +391,62 @@ class XrController extends ChangeNotifier {
       notifyListeners();
       return;
     }
-    if (recognizing) {
-      unawaited(_call('speechStop'));
+    if (dictating) {
+      stopDictation();
+      finishDictation(XrDictationAction.send);
       return;
     }
-    _draft = transcript.isEmpty ? '' : '$transcript\n';
+    _dictation.begin();
+    transcript = '';
     recognizing = true;
-    unawaited(_call('speechStart'));
+    unawaited(_call('speechStart', {'generation': _dictation.generation}));
+    _overlay();
     notifyListeners();
   }
 
+  void stopDictation() {
+    if (!dictating || _dictation.stopping) return;
+    _dictation.stop();
+    unawaited(_call('speechStop'));
+    _overlay();
+    notifyListeners();
+  }
+
+  void finishDictation(XrDictationAction action) {
+    if (!dictating) return;
+    _dictation.choose(action);
+    transcript = _dictation.preview;
+    _overlay();
+    notifyListeners();
+    if (action == XrDictationAction.discard) {
+      recognizing = listening = false;
+      unawaited(_call('speechCancel'));
+    }
+    unawaited(_sendDictationIfReady());
+  }
+
+  Future<void> _sendDictationIfReady() async {
+    final result = _dictation.takeResult();
+    if (result == null) return;
+    final generation = _dictation.generation;
+    transcript = _dictation.preview;
+    _overlay();
+    notifyListeners();
+    if (!canType) return;
+    if (result.text.isNotEmpty) {
+      await bind.sessionInputString(
+          sessionId: ffi.sessionId, value: result.text);
+    }
+    if (!_disposed &&
+        canType &&
+        generation == _dictation.generation &&
+        result.enter) {
+      ffi.inputModel.inputKey('VK_ENTER', press: true);
+    }
+  }
+
   void cancelSpeech() {
+    _dictation.cancel();
     recognizing = listening = false;
     if (_begun) unawaited(_call('speechCancel'));
     _overlay();
@@ -376,18 +454,21 @@ class XrController extends ChangeNotifier {
 
   void clearText() {
     cancelSpeech();
-    transcript = _draft = '';
+    _dictation.cancel(clear: true);
+    transcript = '';
     _overlay();
     notifyListeners();
   }
 
   void release() {
-    if (!active && _buttons.isEmpty && !recognizing && !listening) return;
+    if (!active && _buttons.isEmpty && !dictating && !recognizing && !listening) {
+      return;
+    }
     for (final secondary in _buttons.toList()) {
       button(secondary, false);
     }
     _clearPressed = false;
-    if (recognizing || listening) cancelSpeech();
+    if (dictating || recognizing || listening) cancelSpeech();
     ffi.inputModel.enterOrLeave(false);
   }
 

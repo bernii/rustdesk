@@ -75,7 +75,7 @@ final class XrOverlay extends View {
         super.onDraw(canvas);
         float w = number("width", 0), h = number("height", 0);
         float viewportRight = getWidth(), viewportTop = 0;
-        if (w > 0 && h > 0) {
+        if (!flag("anchored", true) && w > 0 && h > 0) {
             float scale = flag("fit", true) ? Math.min(getWidth() / w, getHeight() / h) : 1;
             float left = w * scale <= getWidth() ? (getWidth() - w * scale) / 2 : -(w * scale - getWidth()) * number("panX", .5f);
             float top = h * scale <= getHeight() ? (getHeight() - h * scale) / 2 : -(h * scale - getHeight()) * number("panY", .5f);
@@ -99,27 +99,43 @@ final class XrOverlay extends View {
         float clearRight = Math.min(getWidth() - 64 * dp, viewportRight - 8 * dp);
         float clearTop = Math.max(16 * dp, viewportTop + 16 * dp);
         clear.set(clearRight - 116 * dp, clearTop, clearRight, clearTop + 40 * dp);
-        paint.setColor(0xdd192523); canvas.drawRoundRect(clear, 12 * dp, 12 * dp, paint);
-        text(canvas, "Clear text", clear.centerX(), clear.top + 26 * dp, 14 * dp);
+        if (!flag("anchored", true)) {
+            paint.setColor(0xdd192523); canvas.drawRoundRect(clear, 12 * dp, 12 * dp, paint);
+            text(canvas, "Clear text", clear.centerX(), clear.top + 26 * dp, 14 * dp);
+        } else clear.setEmpty();
         lock(canvas, getWidth() - 32 * dp, 36 * dp, 20 * dp, -1);
         String draft = String.valueOf(owner.overlay.getOrDefault("transcript", ""));
-        if (!draft.isEmpty()) {
-            // Wrap rather than dropping the ends of long hypotheses. Keep the latest six lines.
-            paint.setTextSize(20 * dp);
+        boolean dictating = flag("dictating", false);
+        if (!draft.isEmpty() || dictating) {
+            // Keep the preview near the optical center, with margins in output pixels.
+            float unit = Math.min(dp, Math.min(getWidth() / 900f, getHeight() / 600f));
+            float cardWidth = Math.min(getWidth() * .72f, 900 * unit);
+            float textWidth = cardWidth - 48 * unit;
+            paint.setTextSize(24 * unit);
             java.util.ArrayList<String> lines = new java.util.ArrayList<>();
             for (String paragraph : draft.split("\n", -1)) {
                 if (paragraph.isEmpty()) lines.add("");
                 while (!paragraph.isEmpty()) {
-                    int count = paint.breakText(paragraph, true, getWidth() - 100 * dp, null);
+                    int count = paint.breakText(paragraph, true, textWidth, null);
                     if (count == 0) break;
-                    lines.add(paragraph.substring(0, count)); paragraph = paragraph.substring(count);
+                    int space = paragraph.lastIndexOf(' ', count);
+                    if (count < paragraph.length() && space > 0) count = space;
+                    lines.add(paragraph.substring(0, count)); paragraph = paragraph.substring(count).trim();
                 }
             }
-            int start = Math.max(0, lines.size() - 6);
-            float y = getHeight() - (lines.size() - start) * 27 * dp - 20 * dp;
-            paint.setColor(0xdd101918);
-            canvas.drawRoundRect(32 * dp, y - 27 * dp, getWidth() - 32 * dp, getHeight() - 14 * dp, 12 * dp, 12 * dp, paint);
-            for (int i = start; i < lines.size(); i++, y += 27 * dp) text(canvas, lines.get(i), getWidth() / 2f, y, 20 * dp);
+            int start = Math.max(0, lines.size() - 4);
+            float lineHeight = 32 * unit;
+            float cardHeight = (lines.size() - start) * lineHeight + 80 * unit;
+            float top = getHeight() * .60f - cardHeight / 2;
+            float left = (getWidth() - cardWidth) / 2;
+            paint.setColor(0xed101918);
+            canvas.drawRoundRect(left, top, left + cardWidth, top + cardHeight, 16 * unit, 16 * unit, paint);
+            float y = top + 36 * unit;
+            for (int i = start; i < lines.size(); i++, y += lineHeight) text(canvas, lines.get(i), getWidth() / 2f, y, 24 * unit);
+            String hint = !dictating ? "Dictation preview" : flag("dictationStopping", false)
+                    ? "Release: send   ·   Pinch in: Enter   ·   Pinch out: discard"
+                    : "Listening · two-finger tap to finish";
+            text(canvas, hint, getWidth() / 2f, top + cardHeight - 20 * unit, 16 * unit);
         }
         long now = SystemClock.uptimeMillis();
         if (holdStarted >= 0 || now < unlockedUntil) {
@@ -127,7 +143,7 @@ final class XrOverlay extends View {
             lock(canvas, getWidth() / 2f, getHeight() / 2f, 64 * dp, progress);
             text(canvas, holdStarted >= 0 ? "Hold to unlock" : "Unlocked", getWidth() / 2f, getHeight() / 2f + 92 * dp, 18 * dp);
             postInvalidateOnAnimation();
-        } else if (micAlpha > 0) {
+        } else if (micAlpha > 0 && !dictating && draft.isEmpty()) {
             float x = getWidth() / 2f, y = getHeight() / 2f;
             canvas.saveLayerAlpha(x - 90 * dp, y - 90 * dp, x + 90 * dp, y + 110 * dp, (int) (micAlpha * 255));
             canvas.scale(.86f + .14f * micAlpha, .86f + .14f * micAlpha, x, y);

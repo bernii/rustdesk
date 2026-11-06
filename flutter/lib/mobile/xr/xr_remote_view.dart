@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/scheduler.dart';
 import 'xr_controller.dart';
 import 'xr_gestures.dart';
 
@@ -22,13 +23,16 @@ class XrRemoteView extends StatefulWidget {
 }
 
 class _XrRemoteViewState extends State<XrRemoteView>
-    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   XrController get xr => widget.controller;
   late final AnimationController _unlock;
   late final XrGestures _gestures;
   final Map<int, Offset> _points = {};
   final Set<int> _touches = {};
-  Timer? _hold, _secondary, _momentum, _feedback;
+  Timer? _secondary, _feedback;
+  late final Ticker _momentum;
+  Offset _scrollVelocity = Offset.zero;
+  Duration _momentumPrevious = Duration.zero;
   final Stopwatch _clock = Stopwatch()..start();
   int? _lockPointer;
   Offset _lockOrigin = Offset.zero;
@@ -53,12 +57,16 @@ class _XrRemoteViewState extends State<XrRemoteView>
           });
         }
       });
+    _momentum = createTicker(_coast);
     _gestures = XrGestures(
         move: xr.move,
         button: xr.button,
         scroll: xr.scroll,
         zoom: (_) {},
-        dictate: xr.dictate);
+        dictate: xr.dictate,
+        isDictating: () => xr.dictating,
+        stopDictation: xr.stopDictation,
+        finishDictation: xr.finishDictation);
     xr.addListener(_changed);
     WidgetsBinding.instance.addObserver(this);
   }
@@ -69,9 +77,8 @@ class _XrRemoteViewState extends State<XrRemoteView>
   }
 
   void _cancel() {
-    _hold?.cancel();
     _secondary?.cancel();
-    _momentum?.cancel();
+    _momentum.stop();
     _gestures.cancel();
     _points.clear();
   }
@@ -98,6 +105,7 @@ class _XrRemoteViewState extends State<XrRemoteView>
     _cancel();
     _feedback?.cancel();
     _unlock.dispose();
+    _momentum.dispose();
     xr.release();
     super.dispose();
   }
@@ -114,13 +122,11 @@ class _XrRemoteViewState extends State<XrRemoteView>
 
   void _down(PointerDownEvent e) {
     if (_lockPointer != null) return;
-    _momentum?.cancel();
+    _momentum.stop();
     _points[e.pointer] = e.localPosition;
     if (_points.length == 1) {
       _gestures.begin(e.localPosition, _clock.elapsedMilliseconds);
-      _hold = Timer(const Duration(milliseconds: 450), _gestures.hold);
     } else {
-      _hold?.cancel();
       _update(_clock.elapsedMilliseconds);
     }
   }
@@ -137,28 +143,29 @@ class _XrRemoteViewState extends State<XrRemoteView>
       _update(_clock.elapsedMilliseconds);
       return;
     }
-    _hold?.cancel();
     final now = _clock.elapsedMilliseconds;
     if (_gestures.end(now)) {
-      var velocity = Offset(_gestures.velocity.dx.clamp(-2500, 2500),
+      _scrollVelocity = Offset(_gestures.velocity.dx.clamp(-2500, 2500),
           _gestures.velocity.dy.clamp(-2500, 2500));
-      var previous = now;
-      _momentum = Timer.periodic(const Duration(milliseconds: 16), (timer) {
-        if (!xr.canInput) {
-          timer.cancel();
-          return;
-        }
-        final time = _clock.elapsedMilliseconds;
-        final seconds = ((time - previous) / 1000).clamp(0.0, .05);
-        previous = time;
-        xr.scroll(velocity * seconds);
-        velocity *= math.exp(-6 * seconds);
-        if (velocity.distance < 15) timer.cancel();
-      });
+      _momentumPrevious = Duration.zero;
+      _momentum.start();
     }
     _secondary?.cancel();
     _secondary = Timer(const Duration(milliseconds: 300),
         () => _gestures.flushSecondaryTap(_clock.elapsedMilliseconds));
+  }
+
+  void _coast(Duration elapsed) {
+    if (!xr.canInput || xr.dictating) {
+      _momentum.stop();
+      return;
+    }
+    final seconds = ((elapsed - _momentumPrevious).inMicroseconds / 1000000)
+        .clamp(0.0, .05);
+    _momentumPrevious = elapsed;
+    xr.scroll(_scrollVelocity * seconds);
+    _scrollVelocity *= math.exp(-6 * seconds);
+    if (_scrollVelocity.distance <= 15) _momentum.stop();
   }
 
   Widget _pad({Widget? child}) => Listener(
@@ -241,7 +248,7 @@ class _XrRemoteViewState extends State<XrRemoteView>
                           style: TextStyle(fontSize: 28, color: brown)),
                       SizedBox(height: 8),
                       Text(
-                          'One finger to move · hold to drag\nTwo fingers to scroll or right-click\nTwo-finger double-tap to dictate',
+                          'One finger to move · tap to click\nTwo fingers to scroll or right-click\nTwo-finger double-tap to dictate\nThird tap: release to send · pinch in: Enter\nPinch out: discard dictation',
                           textAlign: TextAlign.center,
                           style: TextStyle(color: brown, height: 1.6)),
                     ]))))),
@@ -259,7 +266,40 @@ class _XrRemoteViewState extends State<XrRemoteView>
                                   '${xr.output.width.toInt()} × ${xr.output.height.toInt()} output',
                                   style: const TextStyle(
                                       color: brown, height: 1.5)))),
+                      Padding(
+                          padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+                          child: Column(children: [
+                            Row(children: [
+                              const Expanded(
+                                  child: Text('Trackpad sensitivity',
+                                      style: TextStyle(color: brown))),
+                              Text('${xr.sensitivity.toStringAsFixed(2)}×',
+                                  style: const TextStyle(color: brown)),
+                            ]),
+                            Slider(
+                                value: xr.sensitivity,
+                                min: .5,
+                                max: 8,
+                                divisions: 30,
+                                activeColor: brown,
+                                inactiveColor: brown.withOpacity(.3),
+                                label:
+                                    '${xr.sensitivity.toStringAsFixed(2)}×',
+                                semanticFormatterCallback: (value) =>
+                                    'Trackpad sensitivity ${value.toStringAsFixed(2)} times',
+                                onChanged: xr.setSensitivity),
+                            if (xr.locked)
+                              const Text('Hold the lock to adjust sensitivity',
+                                  style: TextStyle(color: brown, fontSize: 12)),
+                          ])),
                       const Expanded(child: SizedBox()),
+                      if (xr.anchored && xr.trackingStatus.isNotEmpty)
+                        Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 20),
+                            child: Text(xr.trackingStatus,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(color: brown))),
                       if (xr.status.isNotEmpty)
                         Padding(
                             padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -275,24 +315,7 @@ class _XrRemoteViewState extends State<XrRemoteView>
                                 overflow: TextOverflow.ellipsis,
                                 style: const TextStyle(color: brown))),
                       if (!keyboardVisible) ...[
-                        Row(children: [
-                          const SizedBox(width: 20),
-                          const Text('Pointer speed',
-                              style: TextStyle(color: brown)),
-                          Expanded(
-                              child: Slider(
-                                  value: xr.sensitivity,
-                                  min: .5,
-                                  max: 8,
-                                  divisions: 30,
-                                  label:
-                                      '${xr.sensitivity.toStringAsFixed(2)}×',
-                                  onChanged: xr.setSensitivity)),
-                          Text('${xr.sensitivity.toStringAsFixed(2)}×',
-                              style: const TextStyle(color: brown)),
-                          const SizedBox(width: 20)
-                        ]),
-                        if (!xr.fit) ...[
+                        if (!xr.anchored && !xr.fit) ...[
                           _panSlider('Horizontal viewport', xr.pan.dx,
                               (v) => xr.setPan(Offset(v, xr.pan.dy))),
                           _panSlider('Vertical viewport', xr.pan.dy,
@@ -304,11 +327,11 @@ class _XrRemoteViewState extends State<XrRemoteView>
                             children: [
                               TextButton.icon(
                                   onPressed: xr.dictate,
-                                  icon: Icon(xr.recognizing
+                                  icon: Icon(xr.dictating
                                       ? Icons.stop
                                       : Icons.mic_none),
-                                  label: Text(
-                                      xr.recognizing ? 'Stop' : 'Dictate')),
+                                  label:
+                                      Text(xr.dictating ? 'Stop' : 'Dictate')),
                               TextButton.icon(
                                   onPressed: () {
                                     xr.cancelSpeech();
@@ -317,14 +340,56 @@ class _XrRemoteViewState extends State<XrRemoteView>
                                   icon: const Icon(Icons.keyboard_outlined),
                                   label: const Text('Keys')),
                               TextButton(
-                                  onPressed: xr.toggleFit,
+                                  onPressed: xr.toggleAnchored,
                                   child: Text(
-                                      xr.fit ? '1:1 / pan' : 'Fit desktop')),
-                              TextButton(
-                                  onPressed: xr.toggleFullSourceBuffer,
-                                  child: Text(xr.fullSourceBuffer && xr.fit
-                                      ? 'Full-res buffer: on'
-                                      : 'Full-res buffer: off')),
+                                      xr.anchored ? '3DoF: on' : '3DoF: off')),
+                              if (xr.anchored) ...[
+                                TextButton(
+                                    onPressed: xr.recenter,
+                                    child: const Text('Recenter')),
+                                TextButton(
+                                    onPressed: xr.recheckCalibration,
+                                    child: const Text('Recheck')),
+                                TextButton(
+                                    onPressed: () async {
+                                      final proceed = await showDialog<bool>(
+                                          context: context,
+                                          builder: (context) => AlertDialog(
+                                                  title: const Text(
+                                                      'Desk calibration'),
+                                                  content: const Text(
+                                                      'Place the glasses on a stable surface and leave them still until calibration completes.'),
+                                                  actions: [
+                                                    TextButton(
+                                                        onPressed: () =>
+                                                            Navigator.pop(
+                                                                context, false),
+                                                        child: const Text(
+                                                            'Cancel')),
+                                                    TextButton(
+                                                        onPressed: () =>
+                                                            Navigator.pop(
+                                                                context, true),
+                                                        child: const Text(
+                                                            'Start')),
+                                                  ]));
+                                      if (proceed == true && mounted) {
+                                        xr.calibrateStationary();
+                                      }
+                                    },
+                                    child: const Text('Desk calibration')),
+                              ],
+                              if (!xr.anchored)
+                                TextButton(
+                                    onPressed: xr.toggleFit,
+                                    child: Text(
+                                        xr.fit ? '1:1 / pan' : 'Fit desktop')),
+                              if (!xr.anchored)
+                                TextButton(
+                                    onPressed: xr.toggleFullSourceBuffer,
+                                    child: Text(xr.fullSourceBuffer && xr.fit
+                                        ? 'Full-res buffer: on'
+                                        : 'Full-res buffer: off')),
                               TextButton(
                                   onPressed: xr.clearText,
                                   child: const Text('Clear text')),

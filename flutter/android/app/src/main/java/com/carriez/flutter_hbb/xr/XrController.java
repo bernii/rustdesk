@@ -30,8 +30,11 @@ public final class XrController implements DisplayManager.DisplayListener {
     private final DictationController speech;
     String session;
     private String pendingSpeechSession;
+    private int speechGeneration;
     int displayId = -1;
     XrViewerActivity viewer;
+    volatile Xreal3Dof tracker;
+    private boolean tracking;
     Map<String, Object> overlay = new HashMap<>();
     private boolean foreground = true, opening, pausedByUser, active;
     private String error = "";
@@ -45,16 +48,19 @@ public final class XrController implements DisplayManager.DisplayListener {
         speech = new DictationController(phone, new DictationController.Sink() {
             public void text(String value, boolean complete) {
                 Map<String, Object> args = new HashMap<>();
+                args.put("generation", speechGeneration);
                 args.put("text", value); args.put("complete", complete);
                 event("speech", args);
             }
             public void status(String value, boolean listening) {
                 Map<String, Object> args = new HashMap<>();
+                args.put("generation", speechGeneration);
                 args.put("status", value); args.put("active", listening);
                 event("speechStatus", args);
             }
             public void listening(boolean value) {
                 Map<String, Object> args = new HashMap<>(); args.put("listening", value);
+                args.put("generation", speechGeneration);
                 event("listening", args);
             }
         });
@@ -90,15 +96,20 @@ public final class XrController implements DisplayManager.DisplayListener {
                 if (values != null) overlay.putAll(values);
                 if (viewer != null) viewer.refresh();
                 break;
+            case "recenter": if (tracker != null) tracker.recenter(); break;
+            case "recheckCalibration": if (tracker != null && tracking) tracker.recheckCalibration(); break;
+            case "calibrateStationary": if (tracker != null && tracking) tracker.calibrateStationary(); break;
             case "speechStart":
                 if (Build.VERSION.SDK_INT >= 29 && active && foreground) {
+                    Number generation = call.argument("generation");
+                    speechGeneration = generation == null ? 0 : generation.intValue();
                     if (phone.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                         pendingSpeechSession = session;
                         phone.requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, MIC_REQUEST);
                     } else speech.start();
                 }
                 break;
-            case "speechStop": speech.stop(); break;
+            case "speechStop": pendingSpeechSession = null; speech.stop(); break;
             case "speechCancel": pendingSpeechSession = null; speech.cancel(); break;
             case "sensitivity":
                 Number value = call.argument("value");
@@ -115,6 +126,7 @@ public final class XrController implements DisplayManager.DisplayListener {
         if (grants.length > 0 && grants[0] == PackageManager.PERMISSION_GRANTED) speech.start();
         else {
             Map<String, Object> args = new HashMap<>();
+            args.put("generation", speechGeneration);
             args.put("status", "Microphone permission denied. Use the keyboard instead.");
             args.put("active", false); event("speechStatus", args);
         }
@@ -164,6 +176,7 @@ public final class XrController implements DisplayManager.DisplayListener {
 
     void closed(XrViewerActivity activity) {
         if (viewer != activity) return;
+        tracking(false);
         viewer = null; opening = false; active = false;
         pausedByUser = true;
         speech.cancel(); report();
@@ -182,6 +195,15 @@ public final class XrController implements DisplayManager.DisplayListener {
         channel.invokeMethod(name, args);
     }
 
+    void tracking(boolean value) {
+        if (value == tracking) return;
+        tracking = value;
+        if (value) {
+            if (tracker == null) tracker = new Xreal3Dof(phone);
+            tracker.start();
+        } else if (tracker != null) tracker.stop();
+    }
+
     void clearText() { event("clear", new HashMap<>()); }
     boolean enabled() { return preferences.getBoolean("enabled", true); }
 
@@ -193,9 +215,21 @@ public final class XrController implements DisplayManager.DisplayListener {
         if (viewer != null) viewer.describe(values);
         return values;
     }
+    void reportTracking() {
+        Map<String, Object> values = new HashMap<>();
+        if (tracking && tracker != null) {
+            Xreal3Dof.Snapshot pose = tracker.snapshot();
+            values.put("trackingStatus", pose.status());
+            values.put("trackingReady", pose.ready());
+            values.put("calibrated", pose.calibrated() && pose.ready());
+            values.put("calibrationProgress", pose.progressPercent());
+        }
+        event("tracking", values);
+    }
     void report() { event("state", state()); }
 
     private void closeViewer() {
+        tracking(false);
         handler.removeCallbacks(openLater);
         pendingSpeechSession = null;
         speech.cancel();
@@ -208,6 +242,7 @@ public final class XrController implements DisplayManager.DisplayListener {
     public void pause() { foreground = false; closeViewer(); report(); }
     public void dispose() {
         closeViewer(); session = null;
+        if (tracker != null) { tracker.close(); tracker = null; }
         displays.unregisterDisplayListener(this);
         channel.setMethodCallHandler(null);
         if (current.get() == this) current.clear();

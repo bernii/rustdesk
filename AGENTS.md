@@ -230,3 +230,15 @@ Then translate that source into the file's target language (infer the language f
 * New English-text keys use sentence case, not Title Case: `Use ID whitelisting`, **not** `Use ID Whitelisting`. Acronyms (ID, IP, 2FA…) stay uppercase. Legacy Title-Case keys (e.g. `Use IP Whitelisting`) stay as-is — do not rename them.
 * Since the key itself is the English display text, a sentence-case key usually needs **no** `en.rs` entry; add one only when the display text must differ from the key (e.g. `*_tip` keys).
 * Append each new key to `template.rs` (with `""`) and to every `src/lang/*.rs` file (translated, or `""` if unsure; always `""` for `it.rs`), at the end of the list.
+
+## Android/XREAL handoff maintenance
+
+Maintain [docs/ANDROID_XREAL_3DOF_PORTING_GUIDE.md](docs/ANDROID_XREAL_3DOF_PORTING_GUIDE.md)
+as the living XR handoff. Read relevant sections before tracking, calibration,
+projection, timing or display-lifecycle changes. Update its relevant sections,
+evidence links, limitations and dated change record in the same task. Distinguish
+simulation, stationary measurements and wearer feedback; retain useful failed
+experiments. In the combined workspace also update the canonical parent guide.
+The copied `Xreal3Dof.java` is generated in `rustdesk-xr-probe`: update its canonical
+sources/facade, regenerate/check and verify there, then copy with only the package
+changed. Keep private serials, full factory configs and credentials out of docs.

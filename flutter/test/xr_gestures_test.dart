@@ -1,6 +1,7 @@
 import 'dart:ui';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_hbb/mobile/xr/xr_gestures.dart';
+import 'package:flutter_hbb/mobile/xr/xr_dictation.dart';
 
 void main() {
   test('two-finger double-tap dictates without a secondary click', () {
@@ -11,7 +12,10 @@ void main() {
         scroll: (_) {},
         zoom: (_) {},
         button: (secondary, down) => buttons.add('$secondary:$down'),
-        dictate: () => dictations++);
+        dictate: () => dictations++,
+        isDictating: () => false,
+        stopDictation: () {},
+        finishDictation: (_) {});
     void tap(int start) {
       gestures.begin(Offset.zero, start);
       gestures.update(2, Offset.zero, 30, start + 10);
@@ -28,7 +32,8 @@ void main() {
     expect(buttons, ['true:true', 'true:false']);
   });
 
-  test('drag cancellation releases once and slow movement stays precise', () {
+  test('holds and tap-then-move never drag; pointer gain uses smoothed speed',
+      () {
     final buttons = <bool>[];
     final moves = <Offset>[];
     final gestures = XrGestures(
@@ -36,15 +41,76 @@ void main() {
         scroll: (_) {},
         zoom: (_) {},
         button: (_, down) => buttons.add(down),
-        dictate: () {});
+        dictate: () {},
+        isDictating: () => false,
+        stopDictation: () {},
+        finishDictation: (_) {});
     gestures.begin(Offset.zero, 0);
-    gestures.hold();
     gestures.update(1, const Offset(8, 0), 0, 450);
     gestures.cancel();
     gestures.cancel();
-    expect(buttons, [true, false]);
+    expect(buttons, isEmpty);
     expect(moves.single, const Offset(2, 0));
     expect(XrGestures.gain(1.5), 3);
+    gestures.begin(Offset.zero, 1000);
+    gestures.end(1060);
+    gestures.begin(Offset.zero, 1100);
+    gestures.update(1, const Offset(8, 0), 0, 1120);
+    gestures.end(1150);
+    expect(buttons,
+        [true, false]); // The first tap clicks; the second touch only moves.
+    gestures.begin(Offset.zero, 2000);
+    gestures.update(1, const Offset(10, 0), 0, 2100);
+    gestures.update(1, const Offset(20, 0), 0, 2120);
+    expect(
+        moves.last.dx, closeTo(10 * XrGestures.gain(.1 * .6 + .5 * .4), 1e-9));
+  });
+
+  test(
+      'third two-finger touch stops, then release or pinch chooses exactly once',
+      () {
+    for (final action in XrDictationAction.values) {
+      bool active = false;
+      int starts = 0, stops = 0;
+      final actions = <XrDictationAction>[];
+      final buttons = <bool>[], moves = <Offset>[], scrolls = <Offset>[];
+      final gestures = XrGestures(
+          move: moves.add,
+          scroll: scrolls.add,
+          button: (_, down) => buttons.add(down),
+          zoom: (_) {},
+          dictate: () {
+            active = true;
+            starts++;
+          },
+          isDictating: () => active,
+          stopDictation: () => stops++,
+          finishDictation: actions.add);
+      for (final time in [0, 180]) {
+        gestures.begin(Offset.zero, time);
+        gestures.update(2, Offset.zero, 100, time + 10);
+        gestures.end(time + 70);
+      }
+      expect(starts, 1);
+      gestures.begin(Offset.zero, 1000);
+      gestures.update(2, Offset.zero, 100, 1010);
+      expect(stops, 1);
+      expect(actions, isEmpty);
+      final span = action == XrDictationAction.enter
+          ? 70.0
+          : action == XrDictationAction.discard
+              ? 130.0
+              : 100.0;
+      gestures.update(2, const Offset(20, 0), span, 1100);
+      gestures.update(2, const Offset(40, 0), span, 1200);
+      gestures.update(1, Offset.zero, 0, 1500);
+      expect(gestures.end(1510), isFalse);
+      gestures.flushSecondaryTap(2000);
+      expect(actions, [action]);
+      expect(buttons, isEmpty);
+      expect(moves, isEmpty);
+      expect(scrolls, isEmpty);
+    }
   });
 
   test('fit includes the desktop and 1:1 pan reaches every source edge', () {

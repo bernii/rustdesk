@@ -138,3 +138,39 @@ Java_com_carriez_flutter_1hbb_xr_XrRenderer_draw(JNIEnv*, jclass, jint width, ji
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     return glGetError() == GL_NO_ERROR;
 }
+
+// Upload on the owning GL thread before Java takes the late pose snapshot.
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_carriez_flutter_1hbb_xr_XrRenderer_prepareProjection(JNIEnv* env, jclass) {
+    if (!program) return nullptr;
+    int w = 0, h = 0;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (!enabled) return env->NewIntArray(3);
+        if (dirty) {
+            uploading.swap(pending);
+            w = pending_width; h = pending_height;
+            dirty = false;
+        }
+    }
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    if (w > 0) {
+        GLint maximum = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maximum);
+        if (w > maximum || h > maximum) return nullptr;
+        if (frame_width != w || frame_height != h) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                        GL_UNSIGNED_BYTE, uploading.data());
+            frame_width = w; frame_height = h;
+        } else {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA,
+                           GL_UNSIGNED_BYTE, uploading.data());
+        }
+    }
+    if (glGetError() != GL_NO_ERROR) return nullptr;
+    const jint frame[] = {static_cast<jint>(texture), frame_width, frame_height};
+    jintArray result = env->NewIntArray(3);
+    if (result) env->SetIntArrayRegion(result, 0, 3, frame);
+    return result;
+}

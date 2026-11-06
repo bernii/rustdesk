@@ -6,5 +6,6 @@ final class XrRenderer {
     static native boolean pending();
     static native boolean initialize();
     static native boolean draw(int width, int height, boolean fit, float panX, float panY);
+    static native int[] prepareProjection();
     private XrRenderer() {}
 }
