@@ -51,13 +51,36 @@ final class XrProjectionRenderer {
             uv=sourceSize*0.5+focal*surface;
             return true;
         }
+        // One bilinear tap per display pixel aliases thin lines once a display pixel covers more
+        // than one source pixel (distance > 1, the curved screen's edges, head tilt). Average an
+        // n x n grid over the pixel's footprint instead; at 1:1 or magnified this is the single
+        // centre tap, so 1:1 stays pixel-exact. The spread reaches the full footprint by 1.1:
+        // fading in more slowly left ~1.3x minification (a common distance) almost unfiltered.
+        vec3 footprintColor(vec2 pixel, vec2 uv) {
+            vec2 next, ux=vec2(0.0), uy=vec2(0.0);
+            if(sourcePoint(pixel+vec2(1.0,0.0),next)) ux=next-uv;
+            else if(sourcePoint(pixel-vec2(1.0,0.0),next)) ux=uv-next;
+            if(sourcePoint(pixel+vec2(0.0,1.0),next)) uy=next-uv;
+            else if(sourcePoint(pixel-vec2(0.0,1.0),next)) uy=uv-next;
+            float f=max(length(ux),length(uy));
+            if(f<=1.0) return texture2D(source,uv/sourceSize).bgr;
+            float n=min(ceil(f),4.0), spread=min((f-1.0)*10.0,1.0);
+            vec3 sum=vec3(0.0);
+            for(int i=0;i<4;i++) for(int j=0;j<4;j++) {
+                if(float(i)>=n || float(j)>=n) continue;
+                vec2 o=((vec2(float(i),float(j))+0.5)/n-0.5)*spread;
+                vec2 s=clamp(uv+o.x*ux+o.y*uy,vec2(0.5),sourceSize-0.5);
+                sum+=texture2D(source,s/sourceSize).bgr;
+            }
+            return sum/(n*n);
+        }
         void main() {
             vec2 pixel=vec2(gl_FragCoord.x,viewport.y-gl_FragCoord.y);
             gl_FragColor=vec4(0.0,0.0,0.0,1.0);
             vec2 uv;
             if(!sourcePoint(pixel,uv)) return;
             if(any(lessThan(uv,vec2(0.0))) || any(greaterThanEqual(uv,sourceSize))) return;
-            vec4 color=vec4(texture2D(source,uv/sourceSize).bgr,1.0);
+            vec4 color=vec4(footprintColor(pixel,uv),1.0);
             if(cursorRect.z>0.0 && cursorRect.w>0.0) {
                 vec2 c=(uv-cursorRect.xy)/cursorRect.zw;
                 if(all(greaterThanEqual(c,vec2(0.0))) && all(lessThan(c,vec2(1.0)))) {

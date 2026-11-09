@@ -15,18 +15,21 @@ public final class XrProjectionInstrumentation extends Instrumentation {
     private int program, samples, cases;
     private static boolean sharp;
     private boolean checkerStress;
+    private boolean skipGlass;
     private EGLDisplay display;
     @Override public void onCreate(Bundle arguments) {
         super.onCreate(arguments);
         checkerStress = arguments != null && "true".equals(arguments.getString("checker"));
         sharp = arguments != null && "true".equals(arguments.getString("sharp"));
+        // The glass UI and pacing checks need the app on screen; skip them when only GPU projection matters.
+        skipGlass = arguments != null && "false".equals(arguments.getString("glass"));
         start();
     }
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
-            String glass = new XrGlassCheck(this).run();
-            String pacing = checkPacingOffMainThread();
+            String glass = skipGlass ? "glass UI check skipped" : new XrGlassCheck(this).run();
+            String pacing = skipGlass ? "pacing check skipped" : checkPacingOffMainThread();
             checkDictationPreview();
             runChecks();
             result.putString("stream", "\nPASS: " + cases + " GPU projection cases, " + samples
