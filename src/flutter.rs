@@ -1723,6 +1723,13 @@ fn char_to_session_id(c: *const char) -> ResultType<SessionID> {
     SessionID::from_str(str).map_err(|e| anyhow!("{:?}", e))
 }
 
+/// Called by the XR renderer (`librustdesk_xr.so`) to receive MediaCodec frames as YUV.
+#[cfg(all(target_os = "android", feature = "mediacodec"))]
+#[no_mangle]
+pub extern "C" fn rustdesk_xr_set_yuv_sink(sink: Option<scrap::mediacodec::YuvSink>) {
+    scrap::mediacodec::set_yuv_sink(sink);
+}
+
 pub fn session_get_rgba_size(session_id: SessionID, display: usize) -> usize {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         return session

@@ -10,7 +10,7 @@ use ndk::media::{
     NdkMediaError,
 };
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -39,6 +39,24 @@ const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
 pub static H264_DECODER_SUPPORT: AtomicBool = AtomicBool::new(false);
 
+/// Takes decoded planes before RGB conversion; the XR renderer converts them on the GPU.
+/// `u`/`v` point at the first chroma sample of the visible area (NV12: `v == u + 1`, pixel
+/// stride 2). Returns non-zero when it took the frame, so `rgb` is left untouched.
+pub type YuvSink = unsafe extern "C" fn(
+    y: *const u8,
+    y_stride: i32,
+    u: *const u8,
+    v: *const u8,
+    uv_stride: i32,
+    uv_pixel_stride: i32,
+    width: i32,
+    height: i32,
+) -> i32;
+static YUV_SINK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_yuv_sink(sink: Option<YuvSink>) {
+    YUV_SINK.store(sink.map_or(0, |f| f as usize), Ordering::SeqCst);
+}
 pub static H265_DECODER_SUPPORT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -114,7 +132,11 @@ impl MediaCodecDecoder {
                     }
                     let convert_start = Instant::now();
                     let layout = self.layout.as_ref().unwrap();
-                    let res = convert(output.buffer(), layout, rgb);
+                    let res = if send_to_sink(output.buffer(), layout) {
+                        Ok(())
+                    } else {
+                        convert(output.buffer(), layout, rgb)
+                    };
                     self.decoder.release_output_buffer(output, false)?;
                     res?;
                     self.record(decoded, convert_start.elapsed());
@@ -184,6 +206,45 @@ impl MediaCodecDecoder {
             );
             *s = Stats { since: Some(now), ..Default::default() };
         }
+    }
+}
+
+fn send_to_sink(buf: &[u8], l: &Layout) -> bool {
+    let sink = YUV_SINK.load(Ordering::SeqCst);
+    if sink == 0 {
+        return false;
+    }
+    let y_size = l.stride * l.slice_height;
+    let chroma_rows = (l.slice_height + 1) / 2;
+    let last_chroma_row = (l.crop_top + l.height + 1) / 2;
+    let (u, v, uv_stride, pixel_stride, end) = if l.planar {
+        let c_stride = l.stride / 2;
+        let c_off = (l.crop_top / 2) * c_stride + l.crop_left / 2;
+        let u = y_size + c_off;
+        let v = y_size + c_stride * chroma_rows + c_off;
+        (u, v, c_stride, 1, y_size + c_stride * (chroma_rows + last_chroma_row))
+    } else {
+        let u = y_size + (l.crop_top / 2) * l.stride + l.crop_left;
+        (u, u + 1, l.stride, 2, y_size + l.stride * last_chroma_row)
+    };
+    if buf.len() < end {
+        return false;
+    }
+    // SAFETY: the pointer was stored from a `YuvSink`, and every plane offset was
+    // bounds-checked against `buf`, which stays alive for the call.
+    let sink: YuvSink = unsafe { std::mem::transmute(sink) };
+    let base = buf.as_ptr();
+    unsafe {
+        sink(
+            base.add(l.crop_top * l.stride + l.crop_left),
+            l.stride as _,
+            base.add(u),
+            base.add(v),
+            uv_stride as _,
+            pixel_stride,
+            l.width as _,
+            l.height as _,
+        ) != 0
     }
 }
 
