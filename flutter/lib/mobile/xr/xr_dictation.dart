@@ -8,6 +8,8 @@ class XrDictation {
   XrDictationAction? _action;
   String get _text => [_words, _partial].where((s) => s.isNotEmpty).join(' ');
   String get preview => _action == null ? _text : '';
+  String get previewWords => _action == null ? _words : '';
+  String get previewPartial => _action == null ? _partial : '';
   bool get previewVisible => active && _action == null;
 
   void begin() {

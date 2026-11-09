@@ -27,7 +27,15 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
     private volatile int surfaceWidth, surfaceHeight;
     private volatile boolean fit = true;
     private volatile float panX = .5f, panY = .5f;
-    private boolean ticking, fullscreenRequested;
+    private volatile boolean ticking;
+    private boolean fullscreenRequested;
+    private long statsFrom, lastFrameStart, worstGap, busyTotal, busyWorst, uploadTotal, uploadWorst;
+    private int statFrames, slowFrames, uploads;
+    private volatile int thermalStatus;
+    private volatile long mainLateWorst;
+    volatile long framesDrawn;
+    private android.os.HandlerThread pacer;
+    private final XrGlPriority gpuPriority = new XrGlPriority(2, XrGlPriority.HIGH);
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -45,6 +53,7 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
         root.setBackgroundColor(android.graphics.Color.BLACK);
         video = new GLSurfaceView(this);
         video.setEGLContextClientVersion(2);
+        video.setEGLContextFactory(gpuPriority);
         video.setRenderer(this);
         video.setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
         overlay = new XrOverlay(this, owner);
@@ -60,6 +69,8 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
     private void fullscreen() {
         if (Build.VERSION.SDK_INT >= 30) {
             getWindow().setDecorFitsSystemWindows(false);
+            // Before setContentView there's no decor yet, and older Android throws rather than return null.
+            getWindow().getDecorView();
             WindowInsetsController controller = getWindow().getInsetsController();
             if (controller != null) {
                 controller.hide(WindowInsets.Type.systemBars());
@@ -91,10 +102,12 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
             video.onResume(); ticking = true;
             owner.tracking(anchored);
             Choreographer.getInstance().postFrameCallback(this);
+            startPacer();
         }
     }
     @Override protected void onPause() {
         ticking = false;
+        stopPacer();
         if (owner != null && owner.viewer == this) owner.tracking(false);
         Choreographer.getInstance().removeFrameCallback(this);
         if (video != null) { XrRenderer.enable(false); video.onPause(); }
@@ -104,16 +117,44 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
         if (owner != null) owner.closed(this);
         super.onDestroy();
     }
+    // Head-tracked frames are asked for from a thread of their own: the main thread also
+    // has the phone's touches, views and channel messages, and a head moving can't wait for those.
+    private void startPacer() {
+        stopPacer();
+        pacer = new android.os.HandlerThread("xr-pacer", android.os.Process.THREAD_PRIORITY_DISPLAY);
+        pacer.start();
+        new android.os.Handler(pacer.getLooper()).post(() -> {
+            Choreographer choreographer = Choreographer.getInstance();
+            choreographer.postFrameCallback(new Choreographer.FrameCallback() {
+                @Override public void doFrame(long time) {
+                    if (!ticking || video == null) return;
+                    if (anchored || XrRenderer.pending()) video.requestRender();
+                    choreographer.postFrameCallback(this);
+                }
+            });
+        });
+    }
+    private void stopPacer() {
+        if (pacer != null) pacer.quit();
+        pacer = null;
+    }
     @Override public void doFrame(long time) {
         if (!ticking || video == null) return;
-        if (anchored || XrRenderer.pending()) video.requestRender();
+        // Only the status report stays here, and how late this runs says how busy the main thread is.
+        long late = System.nanoTime() - time;
+        if (late > mainLateWorst) mainLateWorst = late;
         if (anchored && time - lastStatus >= 500_000_000L) {
             lastStatus = time; owner.reportTracking();
+            if (Build.VERSION.SDK_INT >= 29) {
+                android.os.PowerManager power = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+                if (power != null) thermalStatus = power.getCurrentThermalStatus();
+            }
         }
         Choreographer.getInstance().postFrameCallback(this);
     }
     @Override public void onSurfaceCreated(GL10 gl, EGLConfig config) {
         projectionReady = false;
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY);
         boolean ok = XrRenderer.initialize();
         XrRenderer.enable(ok);
         runOnUiThread(() -> {
@@ -128,6 +169,8 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
     }
     @Override public void onDrawFrame(GL10 gl) {
         if (surfaceWidth <= 0 || surfaceHeight <= 0) return;
+        long frameStart = System.nanoTime();
+        framesDrawn++;
         Xreal3Dof tracker = owner.tracker;
         boolean ok = anchored
                 ? initializeProjection() && tracker != null && projection.draw(surfaceWidth, surfaceHeight, tracker)
@@ -138,6 +181,42 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
                 if (owner.viewer == this) owner.failed("XR video upload failed. Returned to the phone screen.");
             });
         }
+        frameStats(frameStart, System.nanoTime(), XrRenderer.takeUploadMicros());
+    }
+
+    // What the wearer sees. Once a second, as it can't be read from outside: the
+    // compositor's --latency has nothing for these surfaces on Android 17.
+    private void frameStats(long start, long end, long uploadMicros) {
+        if (statsFrom == 0) statsFrom = start;
+        if (lastFrameStart != 0) {
+            long gap = start - lastFrameStart;
+            worstGap = Math.max(worstGap, gap);
+            if (gap > 25_000_000L) slowFrames++;
+        }
+        lastFrameStart = start;
+        statFrames++;
+        long busy = end - start;
+        busyTotal += busy;
+        busyWorst = Math.max(busyWorst, busy);
+        if (uploadMicros > 0) {
+            uploads++;
+            uploadTotal += uploadMicros;
+            uploadWorst = Math.max(uploadWorst, uploadMicros);
+        }
+        if (start - statsFrom < 1_000_000_000L) return;
+        android.util.Log.i("RustDeskXR", String.format(java.util.Locale.ROOT,
+                "projection %d fps, worst gap %.1f ms, over 25 ms: %d · draw avg %.1f worst %.1f ms · uploads %d avg %.1f worst %.1f ms · "
+                        + "pose stale %d age worst %.1f ms imu %.0f Hz · head %.0f deg/s · main late %.1f ms · gpu %s · thermal %d",
+                statFrames, worstGap / 1e6, slowFrames, busyTotal / 1e6 / statFrames, busyWorst / 1e6,
+                uploads, uploads == 0 ? 0 : uploadTotal / 1e3 / uploads, uploadWorst / 1e3,
+                projection.staleFrames, projection.worstPoseAgeMs, projection.imuHz, projection.worstHeadDegPerSecond,
+                mainLateWorst / 1e6, gpuPriority.granted, thermalStatus));
+        projection.staleFrames = 0;
+        projection.worstPoseAgeMs = projection.worstHeadDegPerSecond = 0;
+        mainLateWorst = 0;
+        statsFrom = start;
+        worstGap = busyTotal = busyWorst = uploadTotal = uploadWorst = 0;
+        statFrames = slowFrames = uploads = 0;
     }
     private boolean initializeProjection() {
         if (projectionReady) return true;
@@ -159,6 +238,13 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
         panX = number("panX", .5f); panY = number("panY", .5f);
         configureBuffer();
         overlay.refresh(); video.requestRender();
+    }
+    /** In 3DoF the cursor is part of the projection, so the window's views have nothing to redraw. */
+    void pointerMoved() {
+        if (video == null) return;
+        if (!anchored) { refresh(); return; }
+        projection.configure(owner.overlay);
+        video.requestRender();
     }
     private void configureBuffer() {
         FrameLayout root = (FrameLayout) video.getParent();
@@ -192,7 +278,7 @@ public final class XrViewerActivity extends Activity implements GLSurfaceView.Re
         values.put("refreshRate", (double) mode.getRefreshRate());
         values.put("surfaceWidth", surfaceWidth); values.put("surfaceHeight", surfaceHeight);
         values.put("viewportWidth", overlay.getWidth()); values.put("viewportHeight", overlay.getHeight());
-        values.put("projection", anchored ? "3DoF · prediction off" : "Flat");
+        values.put("projection", !anchored ? "Flat" : Boolean.TRUE.equals(owner.overlay.get("motionPrediction")) ? "3DoF · prediction on" : "3DoF · prediction off");
         values.put("density", (double) getResources().getDisplayMetrics().density);
     }
 }

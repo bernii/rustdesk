@@ -1,6 +1,7 @@
 #include <GLES2/gl2.h>
 #include <jni.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -139,6 +140,16 @@ Java_com_carriez_flutter_1hbb_xr_XrRenderer_draw(JNIEnv*, jclass, jint width, ji
     return glGetError() == GL_NO_ERROR;
 }
 
+// Only touched on the GL thread.
+static jlong upload_micros = 0;
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_carriez_flutter_1hbb_xr_XrRenderer_takeUploadMicros(JNIEnv*, jclass) {
+    const jlong value = upload_micros;
+    upload_micros = 0;
+    return value;
+}
+
 // Upload on the owning GL thread before Java takes the late pose snapshot.
 extern "C" JNIEXPORT jintArray JNICALL
 Java_com_carriez_flutter_1hbb_xr_XrRenderer_prepareProjection(JNIEnv* env, jclass) {
@@ -156,6 +167,7 @@ Java_com_carriez_flutter_1hbb_xr_XrRenderer_prepareProjection(JNIEnv* env, jclas
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, texture);
     if (w > 0) {
+        const auto upload_start = std::chrono::steady_clock::now();
         GLint maximum = 0;
         glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maximum);
         if (w > maximum || h > maximum) return nullptr;
@@ -167,6 +179,8 @@ Java_com_carriez_flutter_1hbb_xr_XrRenderer_prepareProjection(JNIEnv* env, jclas
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA,
                            GL_UNSIGNED_BYTE, uploading.data());
         }
+        upload_micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - upload_start).count();
     }
     if (glGetError() != GL_NO_ERROR) return nullptr;
     const jint frame[] = {static_cast<jint>(texture), frame_width, frame_height};

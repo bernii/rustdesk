@@ -8,7 +8,7 @@ import '../../models/platform_model.dart';
 import '../../common.dart' show showToast;
 import 'xr_session.dart';
 import '../../models/model.dart';
-import 'xr_gestures.dart';
+import 'xr_gestures.dart' show xrViewport, xrClearTarget;
 import 'xr_dictation.dart';
 import 'xr_video.dart';
 
@@ -35,6 +35,11 @@ class XrController extends ChangeNotifier {
   final XrDictation _dictation = XrDictation();
   bool get dictating => _dictation.active;
   bool _centerPending = true;
+  String _softText = '';
+  bool _overlayQueued = false;
+
+  /// Set by the view hosting the glass trackpad, for what only Flutter can do.
+  VoidCallback? onTrackpadBack, onSessionMenu, onKeyboardRequest;
   final Set<bool> _buttons = {};
   bool _clearPressed = false;
   ui.Image? _cursorImage;
@@ -130,6 +135,9 @@ class XrController extends ChangeNotifier {
         break;
       case 'clear':
         clearText();
+        break;
+      case 'trackpad':
+        _trackpad(args);
         break;
     }
   }
@@ -250,7 +258,17 @@ class XrController extends ChangeNotifier {
     _overlay();
   }
 
+  /// A pointer move and the cursor update it causes both land here; they send one message.
   void _overlay() {
+    if (_overlayQueued) return;
+    _overlayQueued = true;
+    scheduleMicrotask(() {
+      _overlayQueued = false;
+      _sendOverlay();
+    });
+  }
+
+  void _sendOverlay() {
     if (_disposed || !active) return;
     unawaited(_call('overlay', {
       'values': {
@@ -270,6 +288,11 @@ class XrController extends ChangeNotifier {
         'dictating': _dictation.previewVisible,
         'dictationStopping': _dictation.stopping,
         'transcript': transcript,
+        'dictationActive': dictating,
+        'dictationWords': _dictation.previewWords,
+        'dictationPartial': _dictation.previewPartial,
+        'canInput': canInput,
+        'status': status,
       }
     }));
   }
@@ -331,6 +354,148 @@ class XrController extends ChangeNotifier {
     if (x != 0 || y != 0) _mouse({'type': 'trackpad', 'x': '$x', 'y': '$y'});
   }
 
+  /// What the native glass trackpad did. Pointer, button and scroll events take the
+  /// same path the Flutter pad's did, so overlay, cursor and permissions don't change.
+  void _trackpad(Map<String, dynamic> args) {
+    double number(String key) => (args[key] as num? ?? 0).toDouble();
+    switch (args['action']) {
+      case 'move':
+        move(ui.Offset(number('dx'), number('dy')));
+        break;
+      case 'button':
+        button(args['secondary'] == true, args['down'] == true);
+        break;
+      case 'scroll':
+        scroll(ui.Offset(number('dx'), number('dy')));
+        break;
+      case 'dictate':
+        dictate();
+        break;
+      case 'stopDictation':
+        stopDictation();
+        break;
+      case 'finishDictation':
+        finishDictation(XrDictationAction.values
+            .byName((args['how'] as String).toLowerCase()));
+        break;
+      case 'softInput':
+        softInput(args['text'] as String? ?? '');
+        break;
+      case 'softKey':
+        softKey(args['key'] as String);
+        break;
+      case 'softReset':
+        _softText = '';
+        break;
+      case 'keyboard':
+        cancelSpeech();
+        onKeyboardRequest?.call();
+        break;
+      case 'locked':
+        setLocked(args['value'] == true);
+        break;
+      case 'holding':
+        setHolding(args['value'] == true);
+        break;
+      case 'sensitivity':
+        setSensitivity(number('value'));
+        break;
+      case 'anchored':
+        if (anchored != (args['value'] == true)) toggleAnchored();
+        break;
+      case 'fit':
+        if (fit != (args['value'] == true)) toggleFit();
+        break;
+      case 'fullBuffer':
+        setFullSourceBuffer(args['value'] == true);
+        break;
+      case 'pan':
+        setPan(ui.Offset(number('x'), number('y')));
+        break;
+      case 'recenter':
+        recenter();
+        break;
+      case 'recheckCalibration':
+        recheckCalibration();
+        break;
+      case 'calibrateStationary':
+        calibrateStationary();
+        break;
+      case 'center':
+        centerPointer();
+        break;
+      case 'clear':
+        clearText();
+        break;
+      case 'wake':
+        reopen();
+        break;
+      case 'exit':
+        toggleEnabled();
+        break;
+      case 'back':
+        onTrackpadBack?.call();
+        break;
+      case 'sessionMenu':
+        onSessionMenu?.call();
+        break;
+    }
+  }
+
+  /// The field's whole text, as it changes: what's different from the last text goes
+  /// to the remote as typing, with a Backspace per character taken away.
+  void softInput(String text) {
+    final old = _softText;
+    _softText = text;
+    if (!canType) return;
+    var common = 0;
+    while (common < old.length &&
+        common < text.length &&
+        old.codeUnitAt(common) == text.codeUnitAt(common)) {
+      common++;
+    }
+    for (var i = common; i < old.length; i++) {
+      ffi.inputModel.inputKey('VK_BACK');
+    }
+    final added = text.substring(common);
+    if (added.length > 1) {
+      unawaited(bind.sessionInputString(sessionId: ffi.sessionId, value: added));
+    } else if (added == ' ') {
+      ffi.inputModel.inputKey('VK_SPACE');
+    } else if (added.isNotEmpty) {
+      ffi.inputModel.inputKey(added);
+    }
+  }
+
+  void softKey(String key) {
+    if (canType) ffi.inputModel.inputKey(key);
+  }
+
+  void centerPointer() {
+    pointer = ui.Offset(source.width / 2, source.height / 2);
+    move(ui.Offset.zero);
+  }
+
+  /// Shows or hides the glass over Flutter; [closed] also frees it.
+  void showTrackpad(bool visible, {bool closed = false}) =>
+      unawaited(_call('trackpad', {'visible': visible, 'closed': closed}));
+
+  /// The keyboard's gate has passed: the glass field may take the keyboard.
+  void showTrackpadKeyboard() => unawaited(_call('trackpadKeyboard'));
+
+  /// Whether the glass used the back key itself, to close an open panel.
+  Future<bool> trackpadBack() async {
+    try {
+      return await _channel
+              .invokeMethod<bool>('trackpadBack', {'session': session}) ??
+          false;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
   void toggleFit() {
     anchored = false;
     fit = !fit;
@@ -338,9 +503,9 @@ class XrController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void toggleFullSourceBuffer() {
+  void setFullSourceBuffer(bool value) {
     anchored = false;
-    fullSourceBuffer = !fullSourceBuffer;
+    fullSourceBuffer = value;
     fit = true;
     _overlay();
     notifyListeners();

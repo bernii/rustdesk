@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <!-- The glass trackpad is only ever created by XrController from API 30 (trackpadSupported, showGlass). -->
+    <issue id="NewApi">
+        <ignore path="src/main/kotlin/com/carriez/flutter_hbb/xr/glass" />
+    </issue>
+</lint>

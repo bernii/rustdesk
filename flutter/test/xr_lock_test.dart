@@ -21,6 +21,11 @@ class _Input extends Fake implements InputModel {
   bool keyboardInputAllowed = true;
   @override
   void enterOrLeave(bool enter) {}
+  final keys = <String>[];
+  @override
+  void inputKey(String name, {bool? down, bool? press}) {
+    keys.add(name);
+  }
 }
 
 class _Session extends Fake implements FFI {
@@ -63,27 +68,25 @@ void main() {
     controller.dispose();
     binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, null);
   });
-  Future<void> show(WidgetTester tester, {bool reduceMotion = false}) async {
-    tester.view.physicalSize = const Size(412, 916);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
+  Future<void> show(WidgetTester tester, ValueNotifier<int> dialogs) async {
     await controller.begin();
     await tester.pumpWidget(MaterialApp(
-        home: MediaQuery(
-      data: MediaQueryData(
-          size: const Size(412, 916), disableAnimations: reduceMotion),
-      child: XrRemoteView(
-          controller: controller,
-          toolbar: const SizedBox(height: 48),
-          keyboard: const SizedBox(),
-          openKeyboard: () {},
-          close: () {}),
-    )));
+        home: XrRemoteView(
+            controller: controller,
+            toolbar: const SizedBox(height: 48),
+            keyboard: const SizedBox(),
+            requestKeyboard: (allowed) => allowed(),
+            dialogs: dialogs,
+            close: () {})));
   }
 
-  Finder getLock() =>
-      find.bySemanticsLabel('Hold for two seconds to unlock controls');
+  /// What the native trackpad would send.
+  Future<void> action(String name, [Map<String, Object?> values = const {}]) =>
+      binding.defaultBinaryMessenger.handlePlatformMessage(
+          channel.name,
+          channel.codec.encodeMethodCall(MethodCall('trackpad',
+              {'session': controller.session, 'action': name, ...values})),
+          (_) {});
 
   test('starting XR sends the centered cursor to the remote host once',
       () async {
@@ -95,109 +98,108 @@ void main() {
     expect(input.moves, hasLength(1));
   });
 
-  testWidgets('full source buffer can be compared with output-sized rendering',
+  test('trackpad pointer motion is scaled by the saved sensitivity', () async {
+    await controller.begin();
+    final input = controller.ffi.inputModel as _Input;
+    input.moves.clear();
+    await action('move', {'dx': 10.0, 'dy': -5.0});
+    expect(input.moves, [const Offset(1950, 1065)]);
+    await action('center');
+    expect(input.moves.last, const Offset(1920, 1080));
+  });
+
+  test('settings from the glass reach the glasses overlay and tracker',
+      () async {
+    final calls = <MethodCall>[];
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(channel,
+        (call) async {
+      calls.add(call);
+      if (call.method == 'begin') {
+        return {'active': true, 'enabled': true, 'available': true};
+      }
+      return null;
+    });
+    await controller.begin();
+    // A pointer move and its cursor update share one message, sent a microtask later.
+    await Future<void>.delayed(Duration.zero);
+    Map last() => calls
+        .lastWhere((call) => call.method == 'overlay')
+        .arguments['values'] as Map;
+    expect(last()['anchored'], isTrue);
+    await action('anchored', {'value': false});
+    expect(last()['anchored'], isFalse);
+    expect(last()['fullSourceBuffer'], isTrue);
+    await action('fullBuffer', {'value': false});
+    expect(last()['fullSourceBuffer'], isFalse);
+    await action('fit', {'value': false});
+    expect(last()['fit'], isFalse);
+    await action('fullBuffer', {'value': true});
+    expect(last()['fullSourceBuffer'], isTrue);
+    expect(last()['fit'], isTrue);
+    await action('pan', {'x': .25, 'y': .75});
+    expect(last()['panX'], .25);
+    expect(last()['panY'], .75);
+    await action('recenter');
+    await action('recheckCalibration');
+    await action('calibrateStationary');
+    for (final method in [
+      'recenter',
+      'recheckCalibration',
+      'calibrateStationary'
+    ]) {
+      expect(calls.where((call) => call.method == method), hasLength(1));
+    }
+    await action('sensitivity', {'value': 5.0});
+    expect(controller.sensitivity, 5);
+    await action('locked', {'value': false});
+    expect(controller.locked, isFalse);
+  });
+
+  testWidgets('the glass steps aside for dialogs and the session menu',
       (tester) async {
-    final overlays = <Map>[];
+    final shown = <bool>[];
     binding.defaultBinaryMessenger.setMockMethodCallHandler(channel,
         (call) async {
       if (call.method == 'begin') {
         return {'active': true, 'enabled': true, 'available': true};
       }
-      if (call.method == 'overlay')
-        overlays.add(call.arguments['values'] as Map);
+      if (call.method == 'trackpad') shown.add(call.arguments['visible']);
       return null;
     });
-    await show(tester);
-    expect(find.text('3DoF: on'), findsOneWidget);
-    expect(overlays.last['anchored'], isTrue);
-    controller.toggleAnchored();
+    final dialogs = ValueNotifier(0);
+    await show(tester, dialogs);
     await tester.pump();
-    expect(find.text('Full-res buffer: on'), findsOneWidget);
-    expect(overlays.last['fullSourceBuffer'], isTrue);
-    controller.locked = false;
+    expect(shown.last, isTrue);
+    dialogs.value = 1;
+    await tester.pump();
+    expect(shown.last, isFalse);
+    dialogs.value = 0;
+    await tester.pump();
+    expect(shown.last, isTrue);
+    await action('sessionMenu');
+    await tester.pump();
+    expect(shown.last, isFalse);
+    await tester.tap(find.text('Back to trackpad'));
+    await tester.pump();
+    expect(shown.last, isTrue);
     await tester.pumpWidget(const SizedBox());
-    await show(tester);
-    await tester.tap(find.text('Full-res buffer: on'));
-    await tester.pump();
-    expect(overlays.last['fullSourceBuffer'], isFalse);
-    expect(find.text('Full-res buffer: off'), findsOneWidget);
-    await tester.tap(find.text('1:1 / pan'));
-    await tester.pump();
-    expect(overlays.last['fit'], isFalse);
-    await tester.tap(find.text('Full-res buffer: off'));
-    await tester.pump();
-    expect(overlays.last['fullSourceBuffer'], isTrue);
-    expect(overlays.last['fit'], isTrue);
+    expect(shown.last, isFalse);
     expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox());
   });
 
-  testWidgets(
-      '3DoF starts by default and exposes separate calibration controls',
-      (tester) async {
-    final calls = <MethodCall>[];
-    binding.defaultBinaryMessenger.setMockMethodCallHandler(channel,
-        (call) async {
-      calls.add(call);
-      if (call.method == 'begin')
-        return {'active': true, 'enabled': true, 'available': true};
-      return null;
-    });
-    await show(tester);
-    controller.setLocked(false);
-    await tester.pump();
-    expect(find.text('3DoF: on'), findsOneWidget);
-    expect(find.text('Full-res buffer: on'), findsNothing);
-    expect(find.text('Horizontal viewport'), findsNothing);
-    await tester.tap(find.text('Recenter'));
-    await tester.tap(find.text('Recheck'));
-    await tester.tap(find.text('Desk calibration'));
-    await tester.pumpAndSettle();
-    expect(
-        calls.where((call) => call.method == 'calibrateStationary'), isEmpty);
-    await tester.tap(find.text('Start'));
-    await tester.pumpAndSettle();
-    expect(calls.where((call) => call.method == 'recenter'), hasLength(1));
-    expect(calls.where((call) => call.method == 'recheckCalibration'),
-        hasLength(1));
-    expect(calls.where((call) => call.method == 'calibrateStationary'),
-        hasLength(1));
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox());
-  });
-
-  testWidgets(
-      'controls unlock only after two seconds, including with reduced motion',
-      (tester) async {
-    await show(tester, reduceMotion: true);
-    expect(controller.locked, isTrue);
-    final touch = await tester.startGesture(tester.getCenter(getLock()));
-    await tester.pump();
-    expect(find.text('Hold to unlock'), findsOneWidget);
-    await tester.pump(const Duration(milliseconds: 1999));
-    expect(controller.locked, isTrue);
-    await tester.pump(const Duration(milliseconds: 17));
-    expect(controller.locked, isFalse);
-    await touch.up();
-    await tester.pump(const Duration(milliseconds: 600));
-    expect(tester.takeException(), isNull);
-    await tester.pumpWidget(const SizedBox());
-  });
-
-  testWidgets('moving away or releasing early leaves controls locked',
-      (tester) async {
-    await show(tester);
-    var touch = await tester.startGesture(tester.getCenter(getLock()));
-    await tester.pump(const Duration(milliseconds: 500));
-    await touch.up();
-    await tester.pump(const Duration(seconds: 2));
-    expect(controller.locked, isTrue);
-    touch = await tester.startGesture(tester.getCenter(getLock()));
-    await touch.moveBy(const Offset(-20, 0));
-    await tester.pump(const Duration(seconds: 2));
-    expect(controller.locked, isTrue);
-    await touch.up();
-    await tester.pumpWidget(const SizedBox());
-    expect(tester.takeException(), isNull);
+  test('typing sends what changed, and clearing the field sends nothing',
+      () async {
+    await controller.begin();
+    final input = controller.ffi.inputModel as _Input;
+    await action('softInput', {'text': 'a'});
+    await action('softInput', {'text': 'ab'});
+    await action('softInput', {'text': 'a'});
+    await action('softInput', {'text': 'a '});
+    expect(input.keys, ['a', 'b', 'VK_BACK', 'VK_SPACE']);
+    await action('softReset');
+    await action('softInput', {'text': 'c'});
+    expect(input.keys.last, 'c');
+    await action('softKey', {'key': 'VK_RETURN'});
+    expect(input.keys.last, 'VK_RETURN');
   });
 }

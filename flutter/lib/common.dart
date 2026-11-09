@@ -785,6 +785,8 @@ class OverlayKeyState {
 
 class OverlayDialogManager {
   final Map<String, Dialog> _dialogs = {};
+  // For XR's native trackpad, which draws over Flutter and steps aside for dialogs.
+  final ValueNotifier<int> openDialogs = ValueNotifier(0);
   var _overlayKeyState = OverlayKeyState();
   int _tagCount = 0;
 
@@ -815,11 +817,13 @@ class OverlayDialogManager {
       BackButtonInterceptor.removeByName(key);
     });
     _dialogs.clear();
+    openDialogs.value = 0;
   }
 
   void dismissByTag(String tag) {
     _dialogs[tag]?.complete(null);
     _dialogs.remove(tag);
+    openDialogs.value = _dialogs.length;
     BackButtonInterceptor.removeByName(tag);
   }
 
@@ -847,9 +851,11 @@ class OverlayDialogManager {
 
     final dialog = Dialog<T>();
     _dialogs[dialogTag] = dialog;
+    openDialogs.value = _dialogs.length;
 
     close([res]) {
       _dialogs.remove(dialogTag);
+      openDialogs.value = _dialogs.length;
       try {
         dialog.complete(res);
       } catch (e) {

@@ -165,6 +165,17 @@ public final class Xreal3Dof implements AutoCloseable {
         public double[] quaternionWxyz() { return reading.quaternion.clone(); }
         public double[] biasRadPerSecond() { return reading.bias.clone(); }
         public double[] angularVelocityRadPerSecond() { return reading.angularVelocity.clone(); }
+        /**
+         * Explicit opt-in: this reading extrapolated by the V2a model, Hamilton WXYZ.
+         * Pass seconds ahead of sampleMonotonicSeconds(), including the sample's age once.
+         * Render-only: never feed it back into tracking. Check fresh() first; don't predict stale data.
+         * Bounded to 50 ms. The caller chooses and owns the horizon; it isn't a measured latency.
+         */
+        public double[] predictedQuaternionWxyz(double secondsAheadOfSample) {
+            double[] out=new double[4];
+            reading.prediction(PredictionModel.V2A).predict(reading.quaternion,secondsAheadOfSample,out);
+            return out;
+        }
     }
 
     /** Pure geometry for alternate renderers, pointer mapping and independent shader checks. */

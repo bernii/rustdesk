@@ -2,6 +2,7 @@ package com.carriez.flutter_hbb.xr;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.ActivityOptions;
 import android.content.Context;
 import android.content.Intent;
@@ -12,6 +13,8 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Display;
+import com.carriez.flutter_hbb.xr.glass.SavedSettings;
+import com.carriez.flutter_hbb.xr.glass.XrGlassHost;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
@@ -28,6 +31,8 @@ public final class XrController implements DisplayManager.DisplayListener {
     final MethodChannel channel;
     private final SharedPreferences preferences;
     private final DictationController speech;
+    private final SavedSettings screen;
+    XrGlassHost glass;
     String session;
     private String pendingSpeechSession;
     private int speechGeneration;
@@ -44,6 +49,7 @@ public final class XrController implements DisplayManager.DisplayListener {
         this.phone = phone;
         displays = (DisplayManager) phone.getSystemService(Context.DISPLAY_SERVICE);
         preferences = phone.getSharedPreferences("rustdesk-xr", Context.MODE_PRIVATE);
+        screen = new SavedSettings(phone);
         channel = new MethodChannel(messenger, "rustdesk-xr");
         speech = new DictationController(phone, new DictationController.Sink() {
             public void text(String value, boolean complete) {
@@ -75,6 +81,7 @@ public final class XrController implements DisplayManager.DisplayListener {
             session = call.argument("session");
             pausedByUser = false;
             error = "";
+            screenSettings(screen.getDistance(), screen.getCurvature(), screen.getMotionPrediction());
             schedule();
             result.success(state());
             return;
@@ -84,7 +91,7 @@ public final class XrController implements DisplayManager.DisplayListener {
             return;
         }
         switch (call.method) {
-            case "end": closeViewer(); session = null; overlay.clear(); break;
+            case "end": closeViewer(); closeGlass(); session = null; overlay.clear(); break;
             case "enabled":
                 preferences.edit().putBoolean("enabled", Boolean.TRUE.equals(call.argument("value"))).apply();
                 pausedByUser = false;
@@ -93,9 +100,19 @@ public final class XrController implements DisplayManager.DisplayListener {
             case "reopen": pausedByUser = false; closeViewer(); schedule(); break;
             case "overlay":
                 Map<String, Object> values = call.argument("values");
+                boolean pointerOnly = values != null && onlyPointerChanged(values);
                 if (values != null) overlay.putAll(values);
-                if (viewer != null) viewer.refresh();
+                if (viewer != null) {
+                    if (pointerOnly) viewer.pointerMoved(); else viewer.refresh();
+                }
+                if (glass != null && !pointerOnly) glass.update(overlay);
                 break;
+            case "trackpad":
+                if (Boolean.TRUE.equals(call.argument("closed"))) closeGlass();
+                else showGlass(Boolean.TRUE.equals(call.argument("visible")));
+                break;
+            case "trackpadKeyboard": if (glass != null) glass.showKeyboard(); break;
+            case "trackpadBack": result.success(glass != null && glass.back()); return;
             case "recenter": if (tracker != null) tracker.recenter(); break;
             case "recheckCalibration": if (tracker != null && tracking) tracker.recheckCalibration(); break;
             case "calibrateStationary": if (tracker != null && tracking) tracker.calibrateStationary(); break;
@@ -132,8 +149,53 @@ public final class XrController implements DisplayManager.DisplayListener {
         }
     }
 
+    /** This arrives with every pointer move, and most of what it can touch didn't change. */
+    private boolean onlyPointerChanged(Map<String, Object> values) {
+        for (Map.Entry<String, Object> entry : values.entrySet()) {
+            String key = entry.getKey();
+            if (!"x".equals(key) && !"y".equals(key) && !java.util.Objects.equals(entry.getValue(), overlay.get(key))) return false;
+        }
+        return true;
+    }
+
+    /** The trackpad draws with GLES 3 and paces itself with API 30's Surface.setFrameRate. */
+    private boolean trackpadSupported() {
+        if (Build.VERSION.SDK_INT < 30) return false;
+        ActivityManager manager = phone.getSystemService(ActivityManager.class);
+        return manager != null && manager.getDeviceConfigurationInfo().reqGlEsVersion >= 0x30000;
+    }
+
+    private void showGlass(boolean visible) {
+        if (Build.VERSION.SDK_INT < 30) return;
+        if (glass == null && visible) {
+            glass = new XrGlassHost(phone, new XrGlassHost.Events() {
+                @Override public void action(Map<String, Object> args) { event("trackpad", args); }
+                @Override public void failed(String message) { XrController.this.failed(message); }
+                @Override public void screen(float distance, float curvature, boolean prediction) {
+                    screenSettings(distance, curvature, prediction);
+                    if (viewer != null) viewer.refresh();
+                }
+            }, preferences.getFloat("sensitivity", 3));
+            glass.update(overlay);
+            glass.update(state());
+        }
+        if (glass != null) glass.show(visible);
+    }
+
+    private void closeGlass() {
+        if (glass == null) return;
+        glass.close();
+        glass = null;
+    }
+
+    private void screenSettings(float distance, float curvature, boolean prediction) {
+        overlay.put("distance", distance);
+        overlay.put("curvature", curvature);
+        overlay.put("motionPrediction", prediction);
+    }
+
     private Display externalDisplay() {
-        if (Build.VERSION.SDK_INT < 29) return null;
+        if (!trackpadSupported()) return null;
         for (Display display : displays.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)) {
             if (display.isValid() && display.getDisplayId() != Display.DEFAULT_DISPLAY) return display;
         }
@@ -224,9 +286,14 @@ public final class XrController implements DisplayManager.DisplayListener {
             values.put("calibrated", pose.calibrated() && pose.ready());
             values.put("calibrationProgress", pose.progressPercent());
         }
+        if (glass != null) glass.update(values);
         event("tracking", values);
     }
-    void report() { event("state", state()); }
+    void report() {
+        Map<String, Object> values = state();
+        if (glass != null) glass.update(values);
+        event("state", values);
+    }
 
     private void closeViewer() {
         tracking(false);
@@ -241,7 +308,7 @@ public final class XrController implements DisplayManager.DisplayListener {
     public void resume() { foreground = true; schedule(); }
     public void pause() { foreground = false; closeViewer(); report(); }
     public void dispose() {
-        closeViewer(); session = null;
+        closeViewer(); closeGlass(); session = null;
         if (tracker != null) { tracker.close(); tracker = null; }
         displays.unregisterDisplayListener(this);
         channel.setMethodCallHandler(null);

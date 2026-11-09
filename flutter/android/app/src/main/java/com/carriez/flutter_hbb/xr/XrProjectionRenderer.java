@@ -16,23 +16,46 @@ import java.util.Map;
 /** Live BGRA texture consumer; the tracker and source producer have independent lifetimes. */
 final class XrProjectionRenderer {
     static final double FOV = 45, DISTANCE = 1;
+    // Android's retained 8 ms optical lead plus one 60 Hz refresh: estimates, not measured photon timing.
+    private static final double PREDICTION_LEAD_SECONDS = 0.008 + 1.0 / 60;
     private static final String VERTEX = "attribute vec2 position; void main(){gl_Position=vec4(position,0.,1.);}";
     private static final String FRAGMENT = """
         precision highp float;
         uniform sampler2D source, labels, cursor;
         uniform vec2 viewport, sourceSize;
         uniform vec4 orientation, calibration, cursorRect;
-        uniform float focal, planeDistance;
+        uniform float focal, planeDistance, curvature;
         """ + Xreal3Dof.CalibrationHud.glsl().replace("texture(", "texture2D(") + """
-        void main() {
-            vec2 pixel=vec2(gl_FragCoord.x,viewport.y-gl_FragCoord.y);
+        // Source pixel (unbounded) seen through a display pixel; false when the ray misses the screen.
+        bool sourcePoint(vec2 pixel, out vec2 uv) {
             vec3 v=vec3((pixel-viewport*0.5)/focal,1.0);
             vec3 ray=v+2.0*cross(orientation.xyz,cross(orientation.xyz,v)+orientation.w*v);
+            vec2 surface;
+            uv=vec2(0.0);
+            if(curvature<=0.0) {
+                if(ray.z<=0.000001) return false;
+                float depth=planeDistance/ray.z;
+                if(depth<0.01) return false;
+                surface=depth*ray.xy;
+            } else {
+                // Mac XR's cylinder: radius planeDistance/curvature, center kept at (0,0,planeDistance).
+                // Solved with the inverse radius so nearly flat values don't subtract huge radii.
+                float k=curvature/planeDistance, a=dot(ray.xz,ray.xz);
+                if(a<0.000000000001) return false;
+                float b=(1.0-curvature)*ray.z;
+                float root=sqrt(b*b+curvature*(2.0-curvature)*a);
+                float depth=b>=0.0?planeDistance*(2.0-curvature)/(root+b):(root-b)/(k*a);
+                float angle=atan(k*depth*ray.x,1.0-curvature+k*depth*ray.z);
+                surface=vec2(angle/k,depth*ray.y);
+            }
+            uv=sourceSize*0.5+focal*surface;
+            return true;
+        }
+        void main() {
+            vec2 pixel=vec2(gl_FragCoord.x,viewport.y-gl_FragCoord.y);
             gl_FragColor=vec4(0.0,0.0,0.0,1.0);
-            if(ray.z<=0.000001) return;
-            float depth=planeDistance/ray.z;
-            if(depth<0.01) return;
-            vec2 uv=sourceSize*0.5+focal*depth*ray.xy;
+            vec2 uv;
+            if(!sourcePoint(pixel,uv)) return;
             if(any(lessThan(uv,vec2(0.0))) || any(greaterThanEqual(uv,sourceSize))) return;
             vec4 color=vec4(texture2D(source,uv/sourceSize).bgr,1.0);
             if(cursorRect.z>0.0 && cursorRect.w>0.0) {
@@ -48,12 +71,17 @@ final class XrProjectionRenderer {
     private final FloatBuffer vertices = ByteBuffer.allocateDirect(6 * 4)
             .order(ByteOrder.nativeOrder()).asFloatBuffer();
     private int program, labelsTexture, cursorTexture;
-    private int viewportUniform, sourceUniform, focalUniform, distanceUniform, poseUniform, calibrationUniform, cursorUniform;
+    private int viewportUniform, sourceUniform, focalUniform, distanceUniform, curvatureUniform, poseUniform, calibrationUniform, cursorUniform;
     private double[] displayedPose = {1, 0, 0, 0};
     private byte[] uploadedCursor;
     private boolean cursorLoaded;
     private int cursorWidth = 24, cursorHeight = 24;
     private volatile Cursor cursor = new Cursor(null, 0, 0, 0, 0, 0, 0, false);
+    private volatile float planeDistance = (float) DISTANCE, curvature;
+    private volatile boolean motionPrediction;
+    // Why a smooth frame rate can still look wrong: read by the same thread that draws.
+    int staleFrames;
+    double worstPoseAgeMs, worstHeadDegPerSecond, imuHz;
 
     private record Cursor(byte[] bytes, float x, float y, float hotX, float hotY,
                           float width, float height, boolean embedded) {}
@@ -65,6 +93,9 @@ final class XrProjectionRenderer {
         cursor = new Cursor(bytes instanceof byte[] ? (byte[]) bytes : null,
                 number(values, "x"), number(values, "y"), number(values, "hotx"), number(values, "hoty"),
                 number(values, "cursorWidth"), number(values, "cursorHeight"), Boolean.TRUE.equals(values.get("cursorEmbedded")));
+        planeDistance = values.containsKey("distance") ? number(values, "distance") : (float) DISTANCE;
+        curvature = number(values, "curvature");
+        motionPrediction = Boolean.TRUE.equals(values.get("motionPrediction"));
     }
     private static float number(Map<String, Object> values, String key) {
         Object value = values.get(key);
@@ -86,7 +117,7 @@ final class XrProjectionRenderer {
         GLES20.glUniform1i(uniform("labels"), 1);
         GLES20.glUniform1i(uniform("cursor"), 2);
         viewportUniform = uniform("viewport"); sourceUniform = uniform("sourceSize");
-        focalUniform = uniform("focal"); distanceUniform = uniform("planeDistance");
+        focalUniform = uniform("focal"); distanceUniform = uniform("planeDistance"); curvatureUniform = uniform("curvature");
         poseUniform = uniform("orientation"); calibrationUniform = uniform("calibration"); cursorUniform = uniform("cursorRect");
         int[] textures = new int[2]; GLES20.glGenTextures(2, textures, 0);
         labelsTexture = textures[0]; cursorTexture = textures[1]; cursorLoaded = false;
@@ -138,7 +169,16 @@ final class XrProjectionRenderer {
         // Read after the potentially expensive video/cursor uploads. Never predict stale data.
         Xreal3Dof.Snapshot snapshot = tracker.snapshot();
         boolean fresh = snapshot.ready();
-        if (fresh) displayedPose = snapshot.quaternionWxyz();
+        double poseAgeSeconds = System.nanoTime() * 1e-9 - snapshot.sampleMonotonicSeconds();
+        if (!fresh) staleFrames++;
+        worstPoseAgeMs = Math.max(worstPoseAgeMs, poseAgeSeconds * 1000);
+        double[] rate = snapshot.angularVelocityRadPerSecond();
+        worstHeadDegPerSecond = Math.max(worstHeadDegPerSecond,
+                Math.toDegrees(Math.sqrt(rate[0] * rate[0] + rate[1] * rate[1] + rate[2] * rate[2])));
+        imuHz = snapshot.acceptedHz();
+        if (fresh) displayedPose = motionPrediction
+                ? snapshot.predictedQuaternionWxyz(poseAgeSeconds + PREDICTION_LEAD_SECONDS)
+                : snapshot.quaternionWxyz();
         Xreal3Dof.CalibrationHud.State hud = Xreal3Dof.CalibrationHud.State.forTracking(
                 true, false, fresh, snapshot.biasReady(), snapshot.calibrated(),
                 snapshot.progressPercent(), snapshot.waitingForConfidence(), System.nanoTime());
@@ -154,7 +194,8 @@ final class XrProjectionRenderer {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE2); GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, cursorTexture);
         GLES20.glUniform2f(viewportUniform, width, height); GLES20.glUniform2f(sourceUniform, frame[1], frame[2]);
         GLES20.glUniform1f(focalUniform, (float) (width / (2 * Math.tan(Math.toRadians(FOV) / 2))));
-        GLES20.glUniform1f(distanceUniform, (float) DISTANCE);
+        GLES20.glUniform1f(distanceUniform, planeDistance);
+        GLES20.glUniform1f(curvatureUniform, curvature);
         // CPU Hamilton WXYZ -> GLSL XYZW; signs match the probe's camera axes.
         GLES20.glUniform4f(poseUniform, (float) pose[1], (float) pose[2], (float) pose[3], (float) pose[0]);
         GLES20.glUniform4f(calibrationUniform, hud.progress(), hud.phase(), hud.animation(), hud.waiting() ? 1 : 0);

@@ -25,16 +25,89 @@ public final class XrProjectionInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            String glass = new XrGlassCheck(this).run();
+            String pacing = checkPacingOffMainThread();
             checkDictationPreview();
             runChecks();
             result.putString("stream", "\nPASS: " + cases + " GPU projection cases, " + samples
-                    + " pixels; BGRA, 1:1 coordinates, rotations, edges, HUD and cursor; 2 dictation overlay layouts.\n");
+                    + " pixels; BGRA, 1:1 coordinates, rotations, edges, distance, curvature, HUD and cursor; 2 dictation overlay layouts; " + pacing + "; " + glass + ".\n");
             finish(Activity.RESULT_OK, result);
         } catch (Throwable failure) {
             result.putString("stream", "\nFAIL: " + android.util.Log.getStackTraceString(failure));
             finish(Activity.RESULT_CANCELED, result);
         } finally {
             if (display != null) { EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT); EGL14.eglTerminate(display); }
+        }
+    }
+    /**
+     * The fix for the wearer's stutter: head-tracked frames must keep coming while the main
+     * thread is busy with the phone's touches. Makes itself a second display if there's none;
+     * that's a system window over the screen, so it only exists during this check.
+     */
+    private String checkPacingOffMainThread() throws Exception {
+        android.hardware.display.DisplayManager displays = (android.hardware.display.DisplayManager)
+                getTargetContext().getSystemService(android.content.Context.DISPLAY_SERVICE);
+        boolean simulated = displays.getDisplays(android.hardware.display.DisplayManager.DISPLAY_CATEGORY_PRESENTATION).length == 0;
+        if (simulated) shell("settings put global overlay_display_devices 1920x1080/240");
+        try {
+            for (int i = 0; i < 50 && displays.getDisplays(android.hardware.display.DisplayManager.DISPLAY_CATEGORY_PRESENTATION).length == 0; i++) {
+                android.os.SystemClock.sleep(200);
+            }
+            android.view.Display[] external = displays.getDisplays(android.hardware.display.DisplayManager.DISPLAY_CATEGORY_PRESENTATION);
+            check(external.length > 0, "a second display for the pacing check");
+            return checkPacingOn(external[0]);
+        } finally {
+            if (simulated) shell("settings delete global overlay_display_devices");
+        }
+    }
+    private void shell(String command) throws Exception {
+        try (android.os.ParcelFileDescriptor out = getUiAutomation().executeShellCommand(command);
+             java.io.FileInputStream in = new android.os.ParcelFileDescriptor.AutoCloseInputStream(out)) {
+            while (in.read() >= 0) { }
+        }
+    }
+    private String checkPacingOn(android.view.Display display) throws Exception {
+        Activity phone = startActivitySync(new android.content.Intent(getTargetContext(),
+                com.carriez.flutter_hbb.MainActivity.class).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK));
+        final XrController[] owner = new XrController[1];
+        runOnMainSync(() -> {
+            owner[0] = XrController.current.get();
+            check(owner[0] != null, "XR controller attached");
+            owner[0].session = "pacing-check";
+            owner[0].displayId = display.getDisplayId();
+            phone.startActivity(new android.content.Intent(phone, XrViewerActivity.class)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK | android.content.Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
+                    .putExtra("session", "pacing-check").putExtra("display", display.getDisplayId()),
+                    android.app.ActivityOptions.makeBasic().setLaunchDisplayId(display.getDisplayId()).toBundle());
+        });
+        try {
+            XrViewerActivity viewer = null;
+            for (long until = android.os.SystemClock.uptimeMillis() + 30000; android.os.SystemClock.uptimeMillis() < until; android.os.SystemClock.sleep(100)) {
+                viewer = owner[0].viewer;
+                if (viewer != null && viewer.framesDrawn > 10) break;
+            }
+            check(viewer != null && viewer.framesDrawn > 10, "the glasses view draws on the second display");
+            // Free-running first, for what this emulator can do at all.
+            long start = viewer.framesDrawn;
+            android.os.SystemClock.sleep(1000);
+            long free = viewer.framesDrawn - start;
+            final long[] during = new long[1];
+            final XrViewerActivity seen = viewer;
+            runOnMainSync(() -> {
+                long before = seen.framesDrawn;
+                android.os.SystemClock.sleep(1000);
+                during[0] = seen.framesDrawn - before;
+            });
+            check(during[0] >= free / 2, "frames keep coming with the main thread blocked: " + during[0] + " in 1 s, " + free + " free-running");
+            return "pacing " + during[0] + " frames/s with the main thread blocked, " + free + " free-running";
+        } finally {
+            runOnMainSync(() -> {
+                XrViewerActivity open = owner[0].viewer;
+                if (open != null) open.finish();
+                owner[0].session = null;
+                phone.finish();
+            });
+            android.os.SystemClock.sleep(1000);
         }
     }
     private void checkDictationPreview() {
@@ -148,6 +221,26 @@ public final class XrProjectionInstrumentation extends Instrumentation {
                 GLES20.glUniform4f(u("cursorRect"),sw/2f-10,sh/2f-10,20,20);
                 ByteBuffer cursor=render(); int i=((H-1-H/2)*W+W/2)*4;
                 check((cursor.get(i)&255)==0 && (cursor.get(i+1)&255)==255 && (cursor.get(i+2)&255)==0,"projected cursor color"); cases++;
+                GLES20.glUniform4f(u("cursorRect"),0,0,0,0);
+                double focal=W/(2*Math.tan(Math.toRadians(XrProjectionRenderer.FOV)/2));
+                for(double distance:new double[]{.5,1,2,3}) for(double bend:new double[]{0,.25,.75,1}) for(double[] q:new double[][]{poses[0],poses[1],poses[4]}) {
+                    if(distance==1 && bend==0) continue; // The homography cases above.
+                    pose(q); GLES20.glUniform1f(u("planeDistance"),(float)distance); GLES20.glUniform1f(u("curvature"),(float)bend);
+                    ByteBuffer rendered=render();
+                    for(int y=7;y<H;y+=61) for(int x=11;x<W;x+=67) {
+                        double[] uv=sourcePoint(x+.5,y+.5,focal,distance,bend,q,sw,sh);
+                        // The source's outer texel is a discontinuity for bilinear filtering, not a geometry check.
+                        if(uv!=null && (uv[0]<2 || uv[1]<2 || uv[0]>sw-2 || uv[1]>sh-2)) continue;
+                        for(int c=0;c<3;c++) {
+                            int expected=uv==null?0:bilinear(uv[0]-.5,uv[1]-.5,sw,sh,c);
+                            int actual=rendered.get(((H-1-y)*W+x)*4+c)&255;
+                            check(Math.abs(expected-actual)<=4,"distance "+distance+" curvature "+bend+" pixel "+x+","+y+" channel "+c+" expected "+expected+" got "+actual);
+                        }
+                        samples++;
+                    }
+                    cases++;
+                }
+                GLES20.glUniform1f(u("planeDistance"),1); GLES20.glUniform1f(u("curvature"),0);
             }
         }
         if (!checkerStress) {
@@ -182,6 +275,29 @@ public final class XrProjectionInstrumentation extends Instrumentation {
         }
         cases++;
         EGL14.eglDestroySurface(display,surface); EGL14.eglDestroyContext(display,context);
+    }
+    /** Independent CPU oracle: Mac XR's Projection.sourcePoint (XRCore/Tracking.swift). */
+    private static double[] sourcePoint(double px,double py,double focal,double distance,double bend,double[] q,int sw,int sh) {
+        double vx=(px-W/2.0)/focal,vy=(py-H/2.0)/focal,vz=1;
+        double w=q[0],qx=q[1],qy=q[2],qz=q[3];
+        double cx=qy*vz-qz*vy+w*vx,cy=qz*vx-qx*vz+w*vy,cz=qx*vy-qy*vx+w*vz;
+        double rx=vx+2*(qy*cz-qz*cy),ry=vy+2*(qz*cx-qx*cz),rz=vz+2*(qx*cy-qy*cx);
+        double sx,sy;
+        if(bend==0) {
+            if(rz<=.000001) return null;
+            double depth=distance/rz;
+            if(depth<.01) return null;
+            sx=depth*rx; sy=depth*ry;
+        } else {
+            double k=bend/distance,a=rx*rx+rz*rz;
+            if(a<1e-12) return null;
+            double b=(1-bend)*rz,root=Math.sqrt(b*b+bend*(2-bend)*a);
+            double depth=b>=0?distance*(2-bend)/(root+b):(root-b)/(k*a);
+            double angle=Math.atan2(k*depth*rx,1-bend+k*depth*rz);
+            sx=angle/k; sy=depth*ry;
+        }
+        double u=sw/2.0+focal*sx,v=sh/2.0+focal*sy;
+        return u>=0 && v>=0 && u<sw && v<sh?new double[]{u,v}:null;
     }
     private int u(String name) { return GLES20.glGetUniformLocation(program,name); }
     private void pose(double[] q) { GLES20.glUniform4f(u("orientation"),(float)q[1],(float)q[2],(float)q[3],(float)q[0]); }

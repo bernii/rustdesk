@@ -91,7 +91,13 @@ class RemotePage extends StatefulWidget {
 
 class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   XrController? _xr;
+  bool _xrWasActive = false;
   void _refreshXr() {
+    // While XR runs, XrRemoteView follows the controller itself; only starting or
+    // ending XR changes what's built here.
+    final active = _xr?.active == true;
+    if (active && _xrWasActive) return;
+    _xrWasActive = active;
     if (mounted) setState(() {});
   }
 
@@ -474,6 +480,32 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     _openKeyboardUnlocked();
   }
 
+  void _requestXrKeyboard(VoidCallback allowed) {
+    void open() {
+      inputModel.keyboardInputAllowed = true;
+      gFFI.invokeMethod("enable_soft_keyboard", true);
+      allowed();
+    }
+
+    final allowWaylandKeyboard =
+        mainGetPeerBoolOptionSync(widget.id, kPeerOptionAllowWaylandKeyboard);
+    if (shouldShowWaylandKeyboardPrompt(
+      connectionId: sessionId.toString(),
+      isWaylandPeer: _shouldGateKeyboardForWayland(),
+      allowWaylandKeyboardRemembered: allowWaylandKeyboard,
+    )) {
+      inputModel.keyboardInputAllowed = false;
+      showWaylandKeyboardInputWarningDialog(
+        id: widget.id,
+        connectionId: sessionId.toString(),
+        ffi: gFFI,
+        onEnable: () async => open(),
+      );
+      return;
+    }
+    open();
+  }
+
   void _openKeyboardUnlocked() {
     inputModel.keyboardInputAllowed = true;
     gFFI.invokeMethod("enable_soft_keyboard", true);
@@ -513,7 +545,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             icon: const Icon(Icons.expand_less),
             onPressed: () => setState(() => _showBar = true),
           ),
-          openKeyboard: openKeyboard,
+          requestKeyboard: _requestXrKeyboard,
+          dialogs: gFFI.dialogManager.openDialogs,
           close: () => clientClose(sessionId, gFFI),
           keyboard: SizedBox(width: 0, height: 0, child: !_showEdit
               ? const SizedBox()
