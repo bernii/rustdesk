@@ -1,0 +1,253 @@
+From: RustDesk XR fork
+Subject: [PATCH] videotoolbox: immediate packets and optional scene-change QP ladder
+
+Complete each H.264/HEVC frame before returning so its packet is not held until later
+input (RUSTDESK_VT_SYNC=0 disables). Optionally (RUSTDESK_VT_SCENE_LADDER, e.g.
+"46,40,34,30"), when most of the frame changes, encode it at a coarse base QP and the next
+frames at decreasing QPs under low-latency rate control, so a soft picture reaches the
+client quickly and sharpens over a few frames (RUSTDESK_VT_SCENE_THRESHOLD sets the
+changed-sample percentage, default 30). A frame the encoder fails in that mode is dropped
+and the next frame is forced to be a key frame.
+---
+--- a/libavcodec/videotoolboxenc.c
++++ b/libavcodec/videotoolboxenc.c
+@@ -232,6 +232,9 @@
+     struct BufNode* next;
+ } BufNode;
+ 
++#define SCENE_GRID_W 64
++#define SCENE_GRID_H 36
++
+ typedef struct VTEncContext {
+     AVClass *class;
+     enum AVCodecID codec_id;
+@@ -281,8 +284,21 @@
+     int max_ref_frames;
+ 
+     int last_bit_rate;
++
++    /* RustDesk scene-change QP ladder, see vtenc_scene_qp(). */
++    int scene_ladder[8];
++    int scene_ladder_len;
++    int scene_threshold;          /* percent of sampled luma points that changed */
++    int scene_step;               /* next ladder index, -1 when idle */
++    int scene_prev_big;
++    int scene_have_samples;
++    int sync_output;              /* wait for each frame's packet before returning */
++    int scene_force_key;          /* set by the output callback after a dropped frame */
++    uint8_t scene_samples[SCENE_GRID_W * SCENE_GRID_H];
+ } VTEncContext;
+ 
++static void vtenc_scene_parse_env(AVCodecContext *avctx);
++
+ static void vtenc_free_buf_node(BufNode *info)
+ {
+     if (!info)
+@@ -740,7 +756,18 @@
+ 
+     av_buffer_unref(&info->frame_buf);
+     if (vtctx->async_error) {
++        vtenc_free_buf_node(info);
++        return;
++    }
++
++    if (status == kVTVideoEncoderMalfunctionErr && vtctx->scene_ladder_len > 0) {
++        /* RustDesk: low-latency rate control with a forced base QP fails one frame, typically
++         * once per session (Apple silicon, H.264 and HEVC). Later frames may reference the
++         * missing one, so drop it and make the next frame a key frame instead of failing the
++         * encoder. */
+         vtenc_free_buf_node(info);
++        __atomic_store_n(&vtctx->scene_force_key, 1, __ATOMIC_SEQ_CST);
++        av_log(avctx, AV_LOG_WARNING, "Dropped a frame the encoder failed under the QP ladder\n");
+         return;
+     }
+ 
+@@ -1687,8 +1714,13 @@
+     }
+ #endif
+ 
+-    // low-latency mode: eliminate frame reordering, follow a one-in-one-out encoding mode
+-    if ((avctx->flags & AV_CODEC_FLAG_LOW_DELAY) && avctx->codec_id == AV_CODEC_ID_H264) {
++    vtenc_scene_parse_env(avctx);
++    // low-latency mode: eliminate frame reordering, follow a one-in-one-out encoding mode.
++    // RustDesk: the scene-change QP ladder needs per-frame base QP, which VideoToolbox only
++    // supports with low-latency rate control, so it enables that for H.264 and HEVC too.
++    if (((avctx->flags & AV_CODEC_FLAG_LOW_DELAY) && avctx->codec_id == AV_CODEC_ID_H264) ||
++        (vtctx->scene_ladder_len > 0 &&
++         (avctx->codec_id == AV_CODEC_ID_H264 || avctx->codec_id == AV_CODEC_ID_HEVC))) {
+         CFDictionarySetValue(enc_info,
+                              compat_keys.kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
+                              kCFBooleanTrue);
+@@ -1727,6 +1759,20 @@
+                                   pixel_buffer_info,
+                                   vtctx->constant_bit_rate,
+                                   &vtctx->session);
++    if (!status && vtctx->scene_ladder_len > 0) {
++        CFBooleanRef supported = NULL;
++        VTSessionCopyProperty(vtctx->session, CFSTR("SupportsBaseFrameQP"),
++                              kCFAllocatorDefault, &supported);
++        if (supported != kCFBooleanTrue) {
++            av_log(avctx, AV_LOG_WARNING, "Scene-change QP ladder disabled: no base frame QP support\n");
++            vtctx->scene_ladder_len = 0;
++        } else {
++            av_log(avctx, AV_LOG_INFO, "Scene-change QP ladder: %d steps from QP %d, threshold %d%%\n",
++                   vtctx->scene_ladder_len, vtctx->scene_ladder[0], vtctx->scene_threshold);
++        }
++        if (supported)
++            CFRelease(supported);
++    }
+ 
+ init_cleanup:
+     if (gamma_level)
+@@ -2562,17 +2608,126 @@
+     }
+ 
+     return 0;
++}
++
++/*
++ * RustDesk: scene-change QP ladder.
++ *
++ * A full-screen change (window switch) makes VideoToolbox emit one P-frame of 1-1.5 MB at 4K,
++ * which takes 100+ ms on a 100 Mbit/s path before the client can show anything. Instead, when
++ * most of the sampled luma changes, encode that frame at a coarse base QP and the next frames
++ * at decreasing QPs, so a soft picture arrives quickly and sharpens over a few frames. The
++ * encoder's own rate control resumes afterwards. If the next frame is also a large change
++ * (scrolling, video), the ladder stops and rate control takes over until things calm down.
++ *
++ * RUSTDESK_VT_SCENE_LADDER: comma-separated QPs, e.g. "46,40,34,30"; unset or "0" = off.
++ * Off by default: low-latency rate control also drops frames to meet its bitrate (RustDesk
++ * treats three empty encodes in a row as a failed encoder) and adds ~45 ms per 4K frame.
++ * RUSTDESK_VT_SCENE_THRESHOLD: percent of sampled points that must change, default 30.
++ *
++ * The encoder fails one frame per session in this mode; see vtenc_output_callback().
++ *
++ * Separately, VideoToolbox returns packets asynchronously and FFmpeg only collects them on a
++ * later call, so a packet normally leaves about two frames after its input, and the last frames
++ * before a static screen wait for the next input. RUSTDESK_VT_SYNC (default on, "0" disables)
++ * completes each frame before returning so its packet is available immediately.
++ */
++static void vtenc_scene_parse_env(AVCodecContext *avctx)
++{
++    VTEncContext *vtctx = avctx->priv_data;
++    const char *ladder = getenv("RUSTDESK_VT_SCENE_LADDER");
++    const char *threshold = getenv("RUSTDESK_VT_SCENE_THRESHOLD");
++    char *end;
++
++    vtctx->scene_ladder_len = 0;
++    vtctx->scene_step = -1;
++    vtctx->scene_prev_big = 0;
++    vtctx->scene_have_samples = 0;
++    vtctx->scene_threshold = threshold ? atoi(threshold) : 30;
++    vtctx->sync_output = (avctx->codec_id == AV_CODEC_ID_H264 || avctx->codec_id == AV_CODEC_ID_HEVC) &&
++                         !(getenv("RUSTDESK_VT_SYNC") && !strcmp(getenv("RUSTDESK_VT_SYNC"), "0"));
++    if (vtctx->scene_threshold <= 0 || vtctx->scene_threshold > 100)
++        vtctx->scene_threshold = 30;
++    if (avctx->codec_id != AV_CODEC_ID_H264 && avctx->codec_id != AV_CODEC_ID_HEVC)
++        return;
++    if (!ladder)
++        return;
++    while (*ladder && vtctx->scene_ladder_len < FF_ARRAY_ELEMS(vtctx->scene_ladder)) {
++        long qp = strtol(ladder, &end, 10);
++        if (end == ladder)
++            break;
++        if (qp <= 0 || qp > 51) {
++            vtctx->scene_ladder_len = 0;
++            return;
++        }
++        vtctx->scene_ladder[vtctx->scene_ladder_len++] = (int)qp;
++        ladder = *end == ',' ? end + 1 : end;
++    }
+ }
+ 
++/* Returns the base QP to force for this frame, or 0 to leave it to rate control. */
++static int vtenc_scene_qp(AVCodecContext *avctx, VTEncContext *vtctx, const AVFrame *frame)
++{
++    int changed = 0, big, qp = 0;
++
++    if (vtctx->scene_ladder_len <= 0 || !frame->data[0] || frame->linesize[0] <= 0 ||
++        avctx->width < SCENE_GRID_W || avctx->height < SCENE_GRID_H)
++        return 0;
++    for (int gy = 0; gy < SCENE_GRID_H; gy++) {
++        const uint8_t *row = frame->data[0] +
++            (size_t)((2 * gy + 1) * avctx->height / (2 * SCENE_GRID_H)) * frame->linesize[0];
++        for (int gx = 0; gx < SCENE_GRID_W; gx++) {
++            uint8_t *prev = &vtctx->scene_samples[gy * SCENE_GRID_W + gx];
++            uint8_t y = row[(2 * gx + 1) * avctx->width / (2 * SCENE_GRID_W)];
++            if (abs((int)y - (int)*prev) > 16)
++                changed++;
++            *prev = y;
++        }
++    }
++    big = vtctx->scene_have_samples &&
++          changed * 100 >= vtctx->scene_threshold * SCENE_GRID_W * SCENE_GRID_H;
++    vtctx->scene_have_samples = 1;
++
++    if (big && vtctx->scene_step > 0) {
++        vtctx->scene_step = -1;           /* still changing: hand back to rate control */
++    } else if (big && !vtctx->scene_prev_big) {
++        vtctx->scene_step = 0;
++    }
++    vtctx->scene_prev_big = big;
++    if (vtctx->scene_step >= 0) {
++        qp = vtctx->scene_ladder[vtctx->scene_step++];
++        if (vtctx->scene_step >= vtctx->scene_ladder_len)
++            vtctx->scene_step = -1;
++    }
++    return qp;
++}
++
+ static int create_encoder_dict_h264(const AVFrame *frame,
++                                    int base_qp,
++                                    int force_key,
+                                     CFDictionaryRef* dict_out)
+ {
+     CFDictionaryRef dict = NULL;
+-    if (frame->pict_type == AV_PICTURE_TYPE_I) {
+-        const void *keys[] = { kVTEncodeFrameOptionKey_ForceKeyFrame };
+-        const void *vals[] = { kCFBooleanTrue };
++    const void *keys[2];
++    const void *vals[2];
++    CFNumberRef qp = NULL;
++    int count = 0;
+ 
+-        dict = CFDictionaryCreate(NULL, keys, vals, 1, NULL, NULL);
++    if (frame->pict_type == AV_PICTURE_TYPE_I || force_key) {
++        keys[count] = kVTEncodeFrameOptionKey_ForceKeyFrame;
++        vals[count++] = kCFBooleanTrue;
++    }
++    if (base_qp > 0) {
++        qp = CFNumberCreate(NULL, kCFNumberIntType, &base_qp);
++        if (!qp) return AVERROR(ENOMEM);
++        keys[count] = CFSTR("BaseFrameQP");
++        vals[count++] = qp;
++    }
++    if (count) {
++        dict = CFDictionaryCreate(NULL, keys, vals, count,
++                                  &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        if (qp)
++            CFRelease(qp);
+         if(!dict) return AVERROR(ENOMEM);
+     }
+ 
+@@ -2598,7 +2753,9 @@
+     if (status)
+         goto out;
+ 
+-    status = create_encoder_dict_h264(frame, &frame_dict);
++    status = create_encoder_dict_h264(frame, vtenc_scene_qp(avctx, vtctx, frame),
++                                      __atomic_exchange_n(&vtctx->scene_force_key, 0, __ATOMIC_SEQ_CST),
++                                      &frame_dict);
+     if (status)
+         goto out;
+ 
+@@ -2622,6 +2779,9 @@
+         node,
+         NULL
+     );
++
++    if (!status && vtctx->sync_output)
++        VTCompressionSessionCompleteFrames(vtctx->session, time);
+ 
+     if (status) {
+         av_log(avctx, AV_LOG_ERROR, "Error: cannot encode frame: %d\n", status);
