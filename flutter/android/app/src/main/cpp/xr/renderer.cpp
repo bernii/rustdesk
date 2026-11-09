@@ -1,5 +1,8 @@
 #include <GLES2/gl2.h>
+#include <android/log.h>
 #include <jni.h>
+#include <sys/system_properties.h>
+#include <time.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -26,6 +29,38 @@ GLuint shader(GLenum type, const char* source) {
     if (!ok) { glDeleteShader(id); return 0; }
     return id;
 }
+
+// Window-switch latency probe, off unless `adb shell setprop debug.rustdesk.xr.latency 1`.
+// Samples a 32×18 grid of the decoded BGRA frame and logs the wall-clock time each
+// time its mean brightness crosses between dark (<70) and light (>170). Pair with a
+// host-side stimulus that logs when it flips the screen; the difference (after clock
+// alignment) is capture+encode+network+decode up to this handoff, not photons.
+int probe_state = 0;  // 0 unknown, 1 dark, 2 light
+void latency_probe(const uint8_t* bytes, int width, int height) {
+    char value[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.rustdesk.xr.latency", value) <= 0 || value[0] != '1') {
+        probe_state = 0;
+        return;
+    }
+    uint64_t sum = 0;
+    for (int gy = 0; gy < 18; ++gy) {
+        const int y = (2 * gy + 1) * height / 36;
+        for (int gx = 0; gx < 32; ++gx) {
+            const uint8_t* p = bytes + (static_cast<size_t>(y) * width + (2 * gx + 1) * width / 64) * 4;
+            sum += (p[0] + 2u * p[1] + p[2]) / 4u;
+        }
+    }
+    const int luma = static_cast<int>(sum / (32 * 18));
+    const int state = luma < 70 ? 1 : luma > 170 ? 2 : probe_state;
+    if (state != probe_state) {
+        timespec now{};
+        clock_gettime(CLOCK_REALTIME, &now);
+        __android_log_print(ANDROID_LOG_INFO, "RustDeskXRLatency", "flip %s luma %d at %lld.%03ld",
+                            state == 1 ? "dark" : "light", luma, static_cast<long long>(now.tv_sec),
+                            now.tv_nsec / 1000000);
+        probe_state = state;
+    }
+}
 }
 
 // The core owns bytes until sessionNextRgba. Copy synchronously into a bounded
@@ -36,6 +71,7 @@ int xr_submit_frame(const uint8_t* bytes, intptr_t length, int width, int height
         static_cast<int64_t>(width) * height * 4 != length) return 0;
     std::lock_guard<std::mutex> guard(mutex);
     if (!enabled) return 0;
+    latency_probe(bytes, width, height);
     pending.resize(static_cast<size_t>(length));
     std::memcpy(pending.data(), bytes, static_cast<size_t>(length));
     pending_width = width;

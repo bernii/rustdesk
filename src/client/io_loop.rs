@@ -1713,6 +1713,20 @@ impl<T: InvokeUiSession> Remote<T> {
                     let Some(thread) = self.video_threads.get_mut(&display) else {
                         return true;
                     };
+                    #[cfg(target_os = "android")]
+                    if crate::client::xr_trace::enabled() {
+                        if let Some((pts, bytes, key, n)) = video_frame_summary(&vf) {
+                            crate::client::xr_trace::log(format!(
+                                "rx pts {} at {:.3} bytes {} key {} n {} q {}",
+                                pts,
+                                crate::client::xr_trace::now(),
+                                bytes,
+                                key,
+                                n,
+                                thread.video_queue.read().unwrap().len()
+                            ));
+                        }
+                    }
                     if Self::contains_key_frame(&vf) {
                         thread
                             .video_sender
@@ -3321,5 +3335,23 @@ mod kept_cursor_tests {
         let mut bomb = compressed(4, 4);
         bomb.colors = hbb_common::compress::compress(&vec![0u8; 1 << 20]).into();
         assert!(kept_cursor_rgba(bomb).is_err(), "more pixels than its size");
+    }
+}
+
+/// Last frame's pts, total encoded bytes, any key frame, frame count of a video message.
+#[cfg(target_os = "android")]
+pub(crate) fn video_frame_summary(vf: &VideoFrame) -> Option<(i64, usize, bool, usize)> {
+    use video_frame::Union::*;
+    match vf.union.as_ref()? {
+        Vp8s(f) | Vp9s(f) | Av1s(f) | H264s(f) | H265s(f) => {
+            let last = f.frames.last()?;
+            Some((
+                last.pts,
+                f.frames.iter().map(|e| e.data.len()).sum(),
+                f.frames.iter().any(|e| e.key),
+                f.frames.len(),
+            ))
+        }
+        _ => None,
     }
 }

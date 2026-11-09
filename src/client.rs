@@ -105,6 +105,8 @@ mod audio_state_tests;
 pub mod file_trait;
 pub mod helper;
 pub mod io_loop;
+#[cfg(target_os = "android")]
+pub mod xr_trace;
 pub mod screenshot;
 
 pub const MILLI1: Duration = Duration::from_millis(1);
@@ -4041,6 +4043,12 @@ pub fn start_video_thread<F, T>(
                         };
                         let display = vf.display as usize;
                         let start = std::time::Instant::now();
+                        #[cfg(target_os = "android")]
+                        let trace_pts = if xr_trace::enabled() {
+                            io_loop::video_frame_summary(&vf).map(|(pts, _, _, _)| pts)
+                        } else {
+                            None
+                        };
                         let format = CodecFormat::from(&vf);
                         if video_handler.is_none() {
                             let mut handler = VideoHandler::new(format, display);
@@ -4056,7 +4064,18 @@ pub fn start_video_thread<F, T>(
                             let mut pixelbuffer = true;
                             let mut tmp_chroma = None;
                             let format_changed = handler.decoder.format() != format;
-                            match handler.handle_frame(vf, &mut pixelbuffer, &mut tmp_chroma) {
+                            let result = handler.handle_frame(vf, &mut pixelbuffer, &mut tmp_chroma);
+                            #[cfg(target_os = "android")]
+                            if let Some(pts) = trace_pts {
+                                xr_trace::log(format!(
+                                    "dec pts {} at {:.3} took {:.1} ms ok {}",
+                                    pts,
+                                    xr_trace::now(),
+                                    start.elapsed().as_secs_f64() * 1000.0,
+                                    matches!(result, Ok(true))
+                                ));
+                            }
+                            match result {
                                 Ok(true) => {
                                     video_callback(
                                         display,
